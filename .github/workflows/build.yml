@@ -1,0 +1,2695 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create VoltGuard project files
+        run: |
+          mkdir -p proj && cd proj
+          cat > README.md <<'VG_END_OF_FILE'
+          # VoltGuard — экономия батареи, очистка и мониторинг для Xiaomi 15T
+
+          Нативное Android-приложение (Kotlin, без сторонних библиотек), minSdk 30, targetSdk 35.
+
+          ## Возможности
+          - **Обзор** — заряд, оставшееся время, оценка оптимизации 0–100, быстрые действия, ОЗУ и хранилище, разряд за 24 ч.
+          - **Батарея** — 12 живых показателей (ток, мощность, температура, напряжение, циклы, оценка ёмкости), графики уровня и температуры за 1–14 дней, расход по часам, анализ разряда в покое и при включённом экране.
+          - **Экономия** — проверка 16 настроек с исправлением в одно касание, профили «Макс. экономия» / «Сбалансированный», скорость анимаций, переходы в фирменные настройки HyperOS (батарея, автозапуск).
+          - **Очистка** — системная очистка кэша всех приложений; глубокое сканирование: временные файлы, логи, миниатюры, пустые папки, остатки удалённых приложений, APK, дубликаты (MD5), большие и старые файлы.
+          - **Приложения** — экранное время, фоновая работа (главная причина разряда в покое), приложения без ограничений батареи, неиспользуемые 30+ дней.
+
+          Замеры батареи — раз в 15 минут через системный JobScheduler, без постоянного фонового сервиса.
+
+          ## Сборка
+          - **Android Studio**: File → Open → папка проекта → Build → Build APK(s).
+          - **GitHub Actions**: workflow `.github/workflows/build.yml` собирает APK и публикует его в Releases.
+          VG_END_OF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'VG_END_OF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.voltguard.app"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.voltguard.app"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+          }
+
+          dependencies {
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'VG_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+                  tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+                  tools:ignore="ScopedStorage" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS"
+                  tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+                  tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+                  tools:ignore="QueryAllPackagesPermission" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.READ_SYNC_SETTINGS" />
+              <uses-permission android:name="android.permission.WRITE_SYNC_SETTINGS" />
+              <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="VoltGuard"
+                  android:theme="@style/AppTheme"
+                  tools:targetApi="35">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".SamplerJob"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_JOB_SERVICE" />
+
+                  <receiver
+                      android:name=".PowerReceiver"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
+                          <action android:name="android.intent.action.ACTION_POWER_DISCONNECTED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/AppsScreen.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.view.View
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+
+          class AppsScreen(a: MainActivity) : Screen(a) {
+              private lateinit var body: LinearLayout
+              var filter = 0 // 0 screen time, 1 background, 2 unrestricted, 3 unused
+              private var days = 1
+              private var data: List<AppStat>? = null
+              private var loadedDays = -1
+
+              override fun build(): View {
+                  val (sv, col) = page("Приложения", "Кто расходует батарею — на экране и в фоне")
+                  body = col.add(a.vbox())
+                  return sv
+              }
+
+              override fun onShow() {
+                  if (data == null || loadedDays != days) load() else render()
+              }
+
+              private fun load() {
+                  body.removeAllViews()
+                  body.add(a.text("Анализ приложений…", 14f, C.SUB), top = 20)
+                  val d = days
+                  bg({ Apps.load(a, if (filter == 3) 30 else d) }) { list ->
+                      data = list; loadedDays = if (filter == 3) -1 else d
+                      render()
+                  }
+              }
+
+              private fun render() {
+                  body.removeAllViews()
+                  val tabs = a.vbox()
+                  val r1 = a.hbox()
+                  val r2 = a.hbox()
+                  listOf("Экранное время", "Работа в фоне").forEachIndexed { i, l ->
+                      r1.add(a.chip(l, filter == i) { switch(i) }, 0, WRAP, 1f, start = if (i == 0) 0 else 4, end = if (i == 0) 4 else 0)
+                  }
+                  listOf("Без ограничений", "Неиспользуемые").forEachIndexed { k, l ->
+                      val i = k + 2
+                      r2.add(a.chip(l, filter == i) { switch(i) }, 0, WRAP, 1f, start = if (k == 0) 0 else 4, end = if (k == 0) 4 else 0)
+                  }
+                  tabs.add(r1)
+                  tabs.add(r2, top = 8)
+                  body.add(tabs, top = 10)
+
+                  if (filter <= 1) {
+                      val pr = a.hbox()
+                      listOf(1 to "24 ч", 7 to "7 дней").forEach { (n, l) ->
+                          pr.add(a.chip(l, days == n) { days = n; load() }, WRAP, WRAP, end = 8)
+                      }
+                      body.add(pr, top = 10)
+                  }
+
+                  if (!Perms.usage(a) && filter != 2) {
+                      val pc = a.card(0xFF2A2140.toInt())
+                      pc.add(a.text("Нужен доступ к истории использования", 15f, C.TEXT, true))
+                      pc.add(a.text("Android выдаёт статистику работы приложений только с этим разрешением. Найдите VoltGuard в списке и включите доступ.", 12.5f, C.SUB), top = 4)
+                      pc.add(a.pill("Разрешить", C.VIOLET) { Perms.requestUsage(a) }, WRAP, WRAP, top = 12)
+                      body.add(pc, top = 14)
+                      return
+                  }
+
+                  val all = data ?: return
+                  val now = System.currentTimeMillis()
+                  val (title, hint, list) = when (filter) {
+                      0 -> Triple(
+                          "Время на экране", "Экран — крупнейший потребитель энергии. Здесь видно, где он работает дольше всего.",
+                          all.filter { it.fg > 60_000 }.sortedByDescending { it.fg }
+                      )
+                      1 -> Triple(
+                          "Фоновая работа (разряд в покое)", "Время, когда приложение держало фоновую службу и не давало телефону уснуть. Главные кандидаты на ограничение.",
+                          all.filter { it.fgs > 60_000 }.sortedByDescending { it.fgs }
+                      )
+                      2 -> Triple(
+                          "Без ограничений батареи", "Эти приложения исключены из оптимизации Android и могут работать в фоне сколько угодно. Оставьте только мессенджеры и будильники.",
+                          all.filter { it.unrestricted && !it.system }.sortedByDescending { it.fgs }
+                      )
+                      else -> Triple(
+                          "Не используются 30+ дней", "Удаление лишних приложений освобождает память и убирает их фоновые задачи.",
+                          all.filter { !it.system && it.fg < 60_000 && (it.lastUsed == 0L || now - it.lastUsed > 30L * 24 * 3_600_000L) && now - it.installed > 30L * 24 * 3_600_000L }
+                              .sortedBy { it.label.lowercase() }
+                      )
+                  }
+
+                  body.add(a.sectionTitle(title))
+                  body.add(a.text(hint, 12.5f, C.SUB), bottom = 10)
+
+                  if (list.isEmpty()) {
+                      val ec = a.card()
+                      ec.add(a.text(if (filter == 1) "Ни одно приложение не держало фоновых служб — отлично!" else "Список пуст", 14f, C.MINT, true))
+                      body.add(ec)
+                      return
+                  }
+
+                  val metric: (AppStat) -> Long = when (filter) { 0 -> { s -> s.fg }; else -> { s -> s.fgs } }
+                  val maxV = list.maxOf { metric(it) }.coerceAtLeast(1L)
+                  val total = list.sumOf { metric(it) }
+                  if (filter <= 1) {
+                      body.add(a.text("Итого: ${fmtDuration(total)} за ${if (days == 1) "24 ч" else "$days дн."}", 13f, C.TEXT, true), bottom = 10)
+                  }
+
+                  val card = a.card()
+                  list.take(60).forEachIndexed { i, s ->
+                      card.add(appRow(s, metric(s), maxV), top = if (i == 0) 0 else 14)
+                  }
+                  body.add(card)
+                  if (filter == 1 || filter == 2) {
+                      body.add(a.text("Нажмите на приложение → «Контроль активности» / «Батарея» → выберите «Ограничить» или «Умный режим».", 12f, C.SUB), top = 10)
+                  }
+                  if (filter == 2 || filter == 1) {
+                      body.add(a.pill("Настройки батареи HyperOS", C.AMBER, filled = false) { Checks.xiaomiBattery(a) }, WRAP, WRAP, top = 10)
+                  }
+              }
+
+              private fun switch(i: Int) {
+                  val needReload = (i == 3) != (filter == 3)
+                  filter = i
+                  if (needReload || data == null) { data = null; load() } else render()
+              }
+
+              private fun appRow(s: AppStat, value: Long, maxV: Long): LinearLayout {
+                  val row = a.hbox()
+                  val iv = ImageView(a).apply { setImageDrawable(s.icon) }
+                  row.add(iv, a.dp(38), a.dp(38))
+                  val mid = a.vbox()
+                  val top = a.hbox()
+                  top.add(a.text(s.label, 14f, C.TEXT, true).apply { maxLines = 1 }, 0, WRAP, 1f)
+                  val right = when (filter) {
+                      0, 1 -> fmtDuration(value)
+                      2 -> if (s.fgs > 0) "фон ${fmtDuration(s.fgs)}" else ""
+                      else -> if (s.lastUsed > 0) "был ${fmtTime(s.lastUsed, "dd.MM.yy")}" else "не запускалось"
+                  }
+                  top.add(a.text(right, 12.5f, if (filter == 1) C.AMBER else C.SUB, true), WRAP, WRAP, start = 8)
+                  mid.add(top)
+                  val tags = ArrayList<String>()
+                  if (s.unrestricted) tags += "без ограничений"
+                  if (s.system) tags += "системное"
+                  if (filter == 0 && s.fgs > 60_000) tags += "фон ${fmtDuration(s.fgs)}"
+                  if (tags.isNotEmpty()) mid.add(a.text(tags.joinToString(" · "), 11f, if (s.unrestricted) C.AMBER else C.SUB))
+                  if (filter <= 1) {
+                      mid.add(MiniBar(a).apply {
+                          fraction = value.toFloat() / maxV
+                          color = if (filter == 1) C.AMBER else C.BLUE
+                      }, MATCH, a.dp(6), top = 6)
+                  }
+                  row.add(mid, 0, WRAP, 1f, start = 12)
+                  if (filter == 3) {
+                      row.add(a.pill("Удалить", C.RED, filled = false) {
+                          a.openFirst(Intent(Intent.ACTION_DELETE, Uri.parse("package:${s.pkg}")))
+                      }, WRAP, WRAP, start = 8)
+                  }
+                  row.setOnClickListener { a.appDetails(s.pkg) }
+                  return row
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/Battery.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.app.job.JobInfo
+          import android.app.job.JobParameters
+          import android.app.job.JobScheduler
+          import android.app.job.JobService
+          import android.content.BroadcastReceiver
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.BatteryManager
+          import android.os.PowerManager
+          import java.io.File
+          import java.util.Calendar
+          import kotlin.math.abs
+          import kotlin.math.max
+
+          data class BatterySnap(
+              val time: Long,
+              val pct: Float,
+              val charging: Boolean,
+              val plugged: Int,
+              val status: Int,
+              val tempC: Float,
+              val voltageMv: Int,
+              val health: Int,
+              val technology: String,
+              val currentMa: Int,
+              val chargeMah: Int,
+              val cycleCount: Int,
+              val chargeTimeRemainingMs: Long
+          ) {
+              val powerW: Float get() = abs(currentMa) * voltageMv / 1_000_000f
+
+              /** Estimated full capacity in mAh from the charge counter, or -1. */
+              val estCapacityMah: Int
+                  get() = if (chargeMah > 0 && pct >= 5f) (chargeMah / (pct / 100f)).toInt() else -1
+
+              val healthText: String
+                  get() = when (health) {
+                      BatteryManager.BATTERY_HEALTH_GOOD -> "Хорошее"
+                      BatteryManager.BATTERY_HEALTH_OVERHEAT -> "Перегрев"
+                      BatteryManager.BATTERY_HEALTH_DEAD -> "Изношена"
+                      BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "Перенапряжение"
+                      BatteryManager.BATTERY_HEALTH_COLD -> "Холод"
+                      BatteryManager.BATTERY_HEALTH_UNSPECIFIED_FAILURE -> "Сбой"
+                      else -> "Неизвестно"
+                  }
+
+              val plugText: String
+                  get() = when (plugged) {
+                      BatteryManager.BATTERY_PLUGGED_AC -> "Сеть"
+                      BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+                      BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Беспроводная"
+                      else -> "Не подключено"
+                  }
+          }
+
+          object Battery {
+              /** Rated capacity of the Xiaomi 15T battery. */
+              const val DESIGN_MAH = 5500
+
+              fun read(ctx: Context): BatterySnap {
+                  val i: Intent? = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_NOT_EXPORTED)
+                  val level = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                  val scale = i?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+                  val status = i?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                  val plugged = i?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+                  val temp = (i?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10f
+                  val volt = i?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0
+                  val health = i?.getIntExtra(BatteryManager.EXTRA_HEALTH, 1) ?: 1
+                  val tech = i?.getStringExtra(BatteryManager.EXTRA_TECHNOLOGY) ?: "Li-ion"
+                  val cycles = i?.getIntExtra("android.os.extra.CYCLE_COUNT", -1) ?: -1
+
+                  val bm = ctx.getSystemService(BatteryManager::class.java)
+                  val raw = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) ?: Int.MIN_VALUE
+                  val curMa = when {
+                      raw == Int.MIN_VALUE -> 0
+                      abs(raw) > 20000 -> raw / 1000 // microamps
+                      else -> raw
+                  }
+                  val cc = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) ?: Int.MIN_VALUE
+                  val ccMah = when {
+                      cc == Int.MIN_VALUE || cc <= 0 -> -1
+                      cc > 100000 -> cc / 1000
+                      else -> cc
+                  }
+                  val remain = try { bm?.computeChargeTimeRemaining() ?: -1L } catch (e: Throwable) { -1L }
+                  val pct = if (level >= 0 && scale > 0) level * 100f / scale else 0f
+                  return BatterySnap(
+                      System.currentTimeMillis(), pct, plugged != 0, plugged, status, temp, volt, health,
+                      tech, curMa, ccMah, cycles, remain
+                  )
+              }
+
+              fun isScreenOn(ctx: Context): Boolean =
+                  ctx.getSystemService(PowerManager::class.java)?.isInteractive ?: true
+          }
+
+          data class Sample(
+              val t: Long,
+              val pct: Float,
+              val charging: Boolean,
+              val screenOn: Boolean,
+              val temp: Float,
+              val curMa: Int
+          )
+
+          object History {
+              private const val FILE = "history.csv"
+              private const val MAX_AGE = 14L * 24 * 3_600_000L
+
+              @Synchronized
+              fun add(ctx: Context, s: Sample) {
+                  val f = File(ctx.filesDir, FILE)
+                  val prefs = ctx.getSharedPreferences("hist", Context.MODE_PRIVATE)
+                  val last = prefs.getLong("last_t", 0L)
+                  if (s.t - last < 60_000L) return
+                  f.appendText("${s.t},${s.pct},${if (s.charging) 1 else 0},${if (s.screenOn) 1 else 0},${s.temp},${s.curMa}\n")
+                  prefs.edit().putLong("last_t", s.t).apply()
+                  if (f.length() > 400_000L) prune(f)
+              }
+
+              private fun prune(f: File) {
+                  val cut = System.currentTimeMillis() - MAX_AGE
+                  val keep = f.readLines().filter { line ->
+                      line.substringBefore(',').toLongOrNull()?.let { it >= cut } ?: false
+                  }
+                  f.writeText(keep.joinToString("\n", postfix = if (keep.isEmpty()) "" else "\n"))
+              }
+
+              @Synchronized
+              fun load(ctx: Context, sinceMs: Long): List<Sample> {
+                  val f = File(ctx.filesDir, FILE)
+                  if (!f.exists()) return emptyList()
+                  val out = ArrayList<Sample>()
+                  f.forEachLine { line ->
+                      val p = line.split(',')
+                      if (p.size >= 6) {
+                          val t = p[0].toLongOrNull() ?: return@forEachLine
+                          if (t < sinceMs) return@forEachLine
+                          out.add(
+                              Sample(
+                                  t, p[1].toFloatOrNull() ?: 0f, p[2] == "1", p[3] == "1",
+                                  p[4].toFloatOrNull() ?: 0f, p[5].toIntOrNull() ?: 0
+                              )
+                          )
+                      }
+                  }
+                  out.sortBy { it.t }
+                  return out
+              }
+
+              @Synchronized
+              fun clear(ctx: Context) {
+                  File(ctx.filesDir, FILE).delete()
+                  ctx.getSharedPreferences("hist", Context.MODE_PRIVATE).edit().clear().apply()
+              }
+          }
+
+          object Sampler {
+              private const val JOB_ID = 4711
+
+              fun record(ctx: Context) {
+                  val b = Battery.read(ctx)
+                  History.add(ctx, Sample(b.time, b.pct, b.charging, Battery.isScreenOn(ctx), b.tempC, b.currentMa))
+              }
+
+              fun schedule(ctx: Context) {
+                  val js = ctx.getSystemService(JobScheduler::class.java) ?: return
+                  if (js.getPendingJob(JOB_ID) != null) return
+                  val job = JobInfo.Builder(JOB_ID, ComponentName(ctx, SamplerJob::class.java))
+                      .setPeriodic(15 * 60_000L)
+                      .setPersisted(true)
+                      .build()
+                  try { js.schedule(job) } catch (e: Throwable) { e.printStackTrace() }
+              }
+          }
+
+          class SamplerJob : JobService() {
+              override fun onStartJob(params: JobParameters?): Boolean {
+                  Thread {
+                      try { Sampler.record(applicationContext) } catch (e: Throwable) { e.printStackTrace() }
+                      jobFinished(params, false)
+                  }.start()
+                  return true
+              }
+
+              override fun onStopJob(params: JobParameters?): Boolean = false
+          }
+
+          class PowerReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val pr = goAsync()
+                  Thread {
+                      try { Sampler.record(context.applicationContext) } catch (e: Throwable) { e.printStackTrace() }
+                      pr.finish()
+                  }.start()
+              }
+          }
+
+          class DrainStats(
+              val idleRate: Float?,   // %/h with screen off
+              val activeRate: Float?, // %/h with screen on
+              val overallRate: Float?,
+              val idleHours: Float,
+              val activeHours: Float,
+              val totalDrop: Float
+          )
+
+          object Analysis {
+              private fun valid(a: Sample, b: Sample): Float? {
+                  val h = (b.t - a.t) / 3_600_000f
+                  if (h < 0.03f || h > 8f) return null
+                  if (a.charging || b.charging) return null
+                  if (b.pct - a.pct > 0.5f) return null // was charged in between
+                  return h
+              }
+
+              fun drain(s: List<Sample>): DrainStats {
+                  var idleDrop = 0f; var idleH = 0f; var actDrop = 0f; var actH = 0f
+                  for (k in 1 until s.size) {
+                      val a = s[k - 1]; val b = s[k]
+                      val h = valid(a, b) ?: continue
+                      val drop = max(0f, a.pct - b.pct)
+                      if (!a.screenOn && !b.screenOn) { idleDrop += drop; idleH += h } else { actDrop += drop; actH += h }
+                  }
+                  val idle = if (idleH >= 0.5f) idleDrop / idleH else null
+                  val act = if (actH >= 0.25f) actDrop / actH else null
+                  val totH = idleH + actH
+                  val all = if (totH >= 0.5f) (idleDrop + actDrop) / totH else null
+                  return DrainStats(idle, act, all, idleH, actH, idleDrop + actDrop)
+              }
+
+              /** Battery drop (%) per clock hour for the last 24 hours. */
+              fun hourly(s: List<Sample>, now: Long): Pair<List<String>, List<Float>> {
+                  val cal = Calendar.getInstance().apply {
+                      timeInMillis = now
+                      set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                  }
+                  val endHour = cal.timeInMillis + 3_600_000L
+                  val startHour = endHour - 24 * 3_600_000L
+                  val vals = FloatArray(24)
+                  for (k in 1 until s.size) {
+                      val a = s[k - 1]; val b = s[k]
+                      valid(a, b) ?: continue
+                      val drop = max(0f, a.pct - b.pct)
+                      val mid = (a.t + b.t) / 2
+                      val idx = ((mid - startHour) / 3_600_000L).toInt()
+                      if (idx in 0..23) vals[idx] += drop
+                  }
+                  val labels = (0 until 24).map { fmtTime(startHour + it * 3_600_000L, "HH") }
+                  return labels to vals.toList()
+              }
+
+              /** Estimated hours left on battery. */
+              fun hoursLeft(b: BatterySnap, d: DrainStats): Float? {
+                  if (b.charging) return null
+                  val r = d.overallRate
+                  if (r != null && r > 0.05f) return b.pct / r
+                  if (b.chargeMah > 0 && abs(b.currentMa) > 20) return b.chargeMah.toFloat() / abs(b.currentMa)
+                  return null
+              }
+
+              fun idleVerdict(rate: Float?): Pair<String, Int> = when {
+                  rate == null -> "Сбор данных…" to C.SUB
+                  rate < 0.6f -> "Отлично" to C.MINT
+                  rate < 1.2f -> "Нормально" to C.CYAN
+                  rate < 2.0f -> "Повышенный" to C.AMBER
+                  else -> "Сильный разряд" to C.RED
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/BatteryScreen.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.content.Intent
+          import android.view.View
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class BatteryScreen(a: MainActivity) : Screen(a) {
+              private lateinit var live: LinearLayout
+              private lateinit var charts: LinearLayout
+              private val liveValues = HashMap<String, TextView>()
+              private var rangeDays = 1
+              private val tick = object : Runnable {
+                  override fun run() { updateLive(); a.handler.postDelayed(this, 2000) }
+              }
+
+              override fun build(): View {
+                  val (sv, col) = page("Батарея", "Показатели в реальном времени и история разряда")
+                  live = col.add(a.vbox(), top = 8)
+                  val keys = listOf(
+                      "Уровень", "Состояние", "Ток", "Мощность", "Температура", "Напряжение",
+                      "Здоровье", "Циклы зарядки", "Текущий заряд", "Оценка ёмкости", "Технология", "Источник"
+                  )
+                  val tiles = keys.map { k ->
+                      val (tile, v) = a.statTile(k, "—")
+                      liveValues[k] = v
+                      tile
+                  }
+                  val card = a.card()
+                  card.add(a.text("Сейчас · обновляется каждые 2 с", 12f, C.SUB), bottom = 10)
+                  card.add(a.grid(tiles, 2))
+                  live.add(card)
+                  charts = col.add(a.vbox())
+                  return sv
+              }
+
+              override fun onShow() {
+                  updateLive()
+                  a.handler.removeCallbacks(tick)
+                  a.handler.postDelayed(tick, 2000)
+                  renderCharts()
+              }
+
+              override fun onHide() { a.handler.removeCallbacks(tick) }
+
+              private fun set(k: String, v: String, color: Int = C.TEXT) {
+                  liveValues[k]?.apply { text = v; setTextColor(color) }
+              }
+
+              private fun updateLive() {
+                  val b = Battery.read(a)
+                  set("Уровень", "${fmt1(b.pct)} %", if (b.pct <= 20) C.RED else C.MINT)
+                  set("Состояние", if (b.charging) "Заряжается" else "Разряжается", if (b.charging) C.MINT else C.TEXT)
+                  set("Ток", "${abs(b.currentMa)} мА", if (b.charging) C.MINT else C.AMBER)
+                  set("Мощность", "${fmt2(b.powerW)} Вт")
+                  set("Температура", "${fmt1(b.tempC)} °C", when { b.tempC >= 42 -> C.RED; b.tempC >= 37 -> C.AMBER; else -> C.TEXT })
+                  set("Напряжение", "${fmt2(b.voltageMv / 1000f)} В")
+                  set("Здоровье", b.healthText, if (b.health == android.os.BatteryManager.BATTERY_HEALTH_GOOD) C.MINT else C.AMBER)
+                  set("Циклы зарядки", if (b.cycleCount >= 0) "${b.cycleCount}" else "н/д")
+                  set("Текущий заряд", if (b.chargeMah > 0) "${b.chargeMah} мА·ч" else "н/д")
+                  val cap = b.estCapacityMah
+                  set(
+                      "Оценка ёмкости",
+                      if (cap > 0) "$cap мА·ч (${min(100, cap * 100 / Battery.DESIGN_MAH)}%)" else "н/д",
+                      if (cap > 0 && cap * 100 / Battery.DESIGN_MAH < 80) C.AMBER else C.TEXT
+                  )
+                  set("Технология", b.technology)
+                  set("Источник", b.plugText)
+              }
+
+              private fun renderCharts() {
+                  val days = rangeDays
+                  bg({
+                      val now = System.currentTimeMillis()
+                      Triple(now, History.load(a, now - days * 24 * 3_600_000L), History.load(a, now - 24 * 3_600_000L))
+                  }) { (now, hist, day) -> fill(now, hist, day) }
+              }
+
+              private fun fill(now: Long, hist: List<Sample>, day: List<Sample>) {
+                  charts.removeAllViews()
+                  val d = Analysis.drain(hist)
+                  val b = Battery.read(a)
+
+                  // Range chips
+                  val chips = a.hbox()
+                  listOf(1 to "24 часа", 3 to "3 дня", 7 to "7 дней", 14 to "14 дней").forEach { (n, label) ->
+                      chips.add(a.chip(label, n == rangeDays) { rangeDays = n; renderCharts() }, WRAP, WRAP, end = 8)
+                  }
+                  charts.add(chips, top = 16)
+
+                  // Level chart
+                  charts.add(a.sectionTitle("Уровень заряда"))
+                  val lc = a.card()
+                  val level = LineChartView(a)
+                  level.setData(hist.map { it.t }, hist.map { it.pct }, 0f, 100f, now - rangeDays * 24 * 3_600_000L, now, C.MINT, "%", hist.map { it.charging })
+                  lc.add(level, MATCH, a.dp(190))
+                  lc.add(a.text("Зелёным фоном отмечены периоды зарядки", 11.5f, C.SUB), top = 6)
+                  charts.add(lc)
+
+                  // Drain analysis
+                  charts.add(a.sectionTitle("Анализ разряда"))
+                  val dc = a.card()
+                  val (verdict, vcol) = Analysis.idleVerdict(d.idleRate)
+                  val hoursLeft = Analysis.hoursLeft(b, d)
+                  val idleLeft = d.idleRate?.takeIf { it > 0.01f }?.let { b.pct / it }
+                  val tiles = listOf(
+                      a.statTile("В покое", d.idleRate?.let { "${fmt2(it)} %/ч" } ?: "—", vcol).first,
+                      a.statTile("Экран включён", d.activeRate?.let { "${fmt1(it)} %/ч" } ?: "—", C.CYAN).first,
+                      a.statTile("Средний разряд", d.overallRate?.let { "${fmt2(it)} %/ч" } ?: "—").first,
+                      a.statTile("Осталось (оценка)", hoursLeft?.let { fmtHours(it) } ?: "—", C.MINT).first,
+                      a.statTile("В покое хватит на", idleLeft?.let { fmtHours(it) } ?: "—", C.VIOLET).first,
+                      a.statTile("Время наблюдения", fmtHours(d.idleHours + d.activeHours)).first
+                  )
+                  dc.add(a.grid(tiles, 2))
+                  dc.add(a.text("Разряд в покое: $verdict", 14f, vcol, true), top = 12)
+                  val tip = when {
+                      d.idleRate == null -> "Оставьте телефон с выключенным экраном хотя бы на 30–60 минут — VoltGuard измерит расход в покое."
+                      d.idleRate < 0.6f -> "Телефон почти не тратит энергию с выключенным экраном. Так и должно быть."
+                      d.idleRate < 1.2f -> "Нормальный расход в покое. Улучшить можно, ограничив фоновые приложения."
+                      else -> "Что-то мешает телефону «засыпать». Проверьте приложения с долгой фоновой работой и без ограничений батареи."
+                  }
+                  dc.add(a.text(tip, 12.5f, C.SUB), top = 4)
+                  if ((d.idleRate ?: 0f) >= 1.2f) {
+                      dc.add(a.pill("Найти виновников", C.AMBER) { a.showApps(1) }, WRAP, WRAP, top = 10)
+                  }
+                  charts.add(dc)
+
+                  // Hourly drain
+                  charts.add(a.sectionTitle("Расход по часам (24 ч)"))
+                  val hc = a.card()
+                  val (labels, vals) = Analysis.hourly(day, now)
+                  val bars = BarChartView(a)
+                  bars.setData(labels, vals, C.BLUE, C.AMBER, 4) { "${fmt1(it)}%" }
+                  hc.add(bars, MATCH, a.dp(150))
+                  hc.add(a.text("Оранжевым выделены часы с повышенным расходом", 11.5f, C.SUB), top = 6)
+                  charts.add(hc)
+
+                  // Temperature
+                  charts.add(a.sectionTitle("Температура"))
+                  val tc = a.card()
+                  val temps = hist.map { it.temp }
+                  val tMin = (temps.minOrNull() ?: 20f).let { max(0f, it - 3f) }
+                  val tMax = (temps.maxOrNull() ?: 40f) + 3f
+                  val tchart = LineChartView(a)
+                  tchart.setData(hist.map { it.t }, temps, tMin, tMax, now - rangeDays * 24 * 3_600_000L, now, C.AMBER, "°")
+                  tc.add(tchart, MATCH, a.dp(150))
+                  val avgT = if (temps.isEmpty()) null else temps.average().toFloat()
+                  tc.add(a.text(
+                      "Средняя ${avgT?.let { fmt1(it) } ?: "—"} °C · максимум ${temps.maxOrNull()?.let { fmt1(it) } ?: "—"} °C. " +
+                          "Нагрев выше 40 °C ускоряет износ аккумулятора.", 12f, C.SUB), top = 6)
+                  charts.add(tc)
+
+                  // Tips for battery longevity
+                  charts.add(a.sectionTitle("Здоровье аккумулятора"))
+                  val hcard = a.card()
+                  val tipsList = listOf(
+                      "Держите заряд в диапазоне 20–80% — это сильнее всего продлевает срок службы.",
+                      "Включите «Оптимизированную зарядку» в настройках батареи HyperOS.",
+                      "Не заряжайте телефон под подушкой и во время игр — нагрев вредит ячейкам.",
+                      "Быструю зарядку 67 Вт+ используйте, когда спешите; ночью лучше обычная."
+                  )
+                  tipsList.forEach { hcard.add(a.text("•  $it", 13f, C.TEXT), bottom = 6) }
+                  hcard.add(a.pill("Настройки батареи HyperOS", C.MINT, filled = false) { Checks.xiaomiBattery(a) }, WRAP, WRAP, top = 6)
+                  hcard.add(a.pill("Статистика расхода Android", C.BLUE, filled = false) {
+                      a.openFirst(Intent(Intent.ACTION_POWER_USAGE_SUMMARY))
+                  }, WRAP, WRAP, top = 8)
+                  charts.add(hcard)
+
+                  charts.add(a.pill("Сбросить историю замеров", C.RED, filled = false) {
+                      History.clear(a); a.toast("История очищена"); renderCharts()
+                  }, WRAP, WRAP, top = 16)
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/Charts.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.SweepGradient
+          import android.view.View
+          import kotlin.math.max
+          import kotlin.math.min
+
+          private fun View.px(v: Float) = v * resources.displayMetrics.density
+
+          /** Circular progress ring with gradient, center value and caption. */
+          class RingView(ctx: Context) : View(ctx) {
+              private var fraction = 0f
+              private var c1 = C.MINT
+              private var c2 = C.BLUE
+              private var center = ""
+              private var sub = ""
+              var strokeDp = 12f
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
+
+              fun set(f: Float, color1: Int, color2: Int, centerText: String, subText: String) {
+                  fraction = f.coerceIn(0f, 1f)
+                  c1 = color1; c2 = color2; center = centerText; sub = subText
+                  invalidate()
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val s = px(strokeDp)
+                  val size = min(width, height).toFloat()
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = size / 2f - s / 2f - px(2f)
+                  rect.set(cx - r, cy - r, cx + r, cy + r)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = s
+                  p.strokeCap = Paint.Cap.ROUND
+                  p.shader = null
+                  p.color = C.LINE
+                  cv.drawArc(rect, 0f, 360f, false, p)
+                  if (fraction > 0.001f) {
+                      p.shader = SweepGradient(cx, cy, intArrayOf(c1, c2, c1), null)
+                      cv.save()
+                      cv.rotate(-90f, cx, cy)
+                      cv.drawArc(rect, 0f, 360f * fraction, false, p)
+                      cv.restore()
+                  }
+                  p.shader = null
+                  p.style = Paint.Style.FILL
+                  p.textAlign = Paint.Align.CENTER
+                  p.color = C.TEXT
+                  p.typeface = BLACK
+                  p.textSize = size * (if (center.length > 5) 0.15f else 0.2f)
+                  val hasSub = sub.isNotEmpty()
+                  cv.drawText(center, cx, cy + p.textSize * (if (hasSub) 0.15f else 0.35f), p)
+                  if (hasSub) {
+                      p.typeface = BOLD
+                      p.color = C.SUB
+                      p.textSize = size * 0.085f
+                      cv.drawText(sub, cx, cy + size * 0.17f, p)
+                  }
+              }
+          }
+
+          /** Donut with several colored segments. */
+          class DonutView(ctx: Context) : View(ctx) {
+              private var parts: List<Pair<Float, Int>> = emptyList()
+              private var center = ""
+              private var sub = ""
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
+
+              fun set(segments: List<Pair<Float, Int>>, centerText: String, subText: String) {
+                  parts = segments; center = centerText; sub = subText; invalidate()
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val s = px(14f)
+                  val size = min(width, height).toFloat()
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = size / 2f - s / 2f - px(2f)
+                  rect.set(cx - r, cy - r, cx + r, cy + r)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = s
+                  p.strokeCap = Paint.Cap.BUTT
+                  p.color = C.LINE
+                  cv.drawArc(rect, 0f, 360f, false, p)
+                  val total = parts.sumOf { it.first.toDouble() }.toFloat()
+                  if (total > 0f) {
+                      var start = -90f
+                      for ((v, col) in parts) {
+                          val sweep = 360f * v / total
+                          if (sweep <= 0f) continue
+                          p.color = col
+                          cv.drawArc(rect, start, max(0.5f, sweep - 1.5f), false, p)
+                          start += sweep
+                      }
+                  }
+                  p.style = Paint.Style.FILL
+                  p.textAlign = Paint.Align.CENTER
+                  p.color = C.TEXT
+                  p.typeface = BLACK
+                  p.textSize = size * 0.15f
+                  cv.drawText(center, cx, cy + p.textSize * 0.2f, p)
+                  p.typeface = BOLD
+                  p.color = C.SUB
+                  p.textSize = size * 0.08f
+                  cv.drawText(sub, cx, cy + size * 0.16f, p)
+              }
+          }
+
+          /** Thin horizontal progress bar. */
+          class MiniBar(ctx: Context) : View(ctx) {
+              var fraction = 0f
+                  set(v) { field = v.coerceIn(0f, 1f); invalidate() }
+              var color = C.MINT
+                  set(v) { field = v; invalidate() }
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
+
+              override fun onDraw(cv: Canvas) {
+                  val h = height.toFloat()
+                  val rad = h / 2f
+                  p.color = C.LINE
+                  rect.set(0f, 0f, width.toFloat(), h)
+                  cv.drawRoundRect(rect, rad, rad, p)
+                  if (fraction > 0f) {
+                      p.color = color
+                      rect.set(0f, 0f, max(h, width * fraction), h)
+                      cv.drawRoundRect(rect, rad, rad, p)
+                  }
+              }
+          }
+
+          /** Time-series line chart with gradient fill, grid and axis labels. */
+          class LineChartView(ctx: Context) : View(ctx) {
+              private var xs: List<Long> = emptyList()
+              private var ys: List<Float> = emptyList()
+              private var marks: List<Boolean> = emptyList()
+              private var minY = 0f
+              private var maxY = 100f
+              private var xStart = 0L
+              private var xEnd = 1L
+              private var color = C.MINT
+              private var unit = ""
+              var compact = false
+              var emptyText = "Недостаточно данных — график наполнится со временем"
+              var markColor = 0x2A2EE6A8
+              var gapMs = 3 * 3_600_000L
+
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val grid = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val label = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              fun setData(
+                  x: List<Long>, y: List<Float>, yMin: Float, yMax: Float,
+                  start: Long, end: Long, col: Int, unitStr: String, highlight: List<Boolean> = emptyList()
+              ) {
+                  xs = x; ys = y; minY = yMin; maxY = if (yMax <= yMin) yMin + 1f else yMax
+                  xStart = start; xEnd = if (end <= start) start + 1 else end
+                  color = col; unit = unitStr; marks = highlight
+                  invalidate()
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val left = if (compact) 0f else px(34f)
+                  val bottom = if (compact) 0f else px(20f)
+                  val top = px(6f)
+                  val w = width - left - px(4f)
+                  val h = height - bottom - top
+                  label.color = C.SUB
+                  label.textSize = px(10f)
+                  grid.color = C.LINE
+                  grid.strokeWidth = px(1f)
+
+                  fun xOf(t: Long) = left + w * ((t - xStart).toFloat() / (xEnd - xStart).toFloat())
+                  fun yOf(v: Float) = top + h * (1f - (v - minY) / (maxY - minY))
+
+                  if (!compact) {
+                      label.textAlign = Paint.Align.RIGHT
+                      for (i in 0..4) {
+                          val v = minY + (maxY - minY) * i / 4f
+                          val y = yOf(v)
+                          cv.drawLine(left, y, left + w, y, grid)
+                          val txt = if (maxY - minY >= 10f) "${v.toInt()}$unit" else "${fmt1(v)}$unit"
+                          cv.drawText(txt, left - px(4f), y + px(3.5f), label)
+                      }
+                      label.textAlign = Paint.Align.CENTER
+                      val span = xEnd - xStart
+                      val pattern = if (span > 36 * 3_600_000L) "dd.MM" else "HH:mm"
+                      for (i in 0..4) {
+                          val t = xStart + span * i / 4
+                          val x = xOf(t)
+                          label.textAlign = when (i) {
+                              0 -> Paint.Align.LEFT
+                              4 -> Paint.Align.RIGHT
+                              else -> Paint.Align.CENTER
+                          }
+                          cv.drawText(fmtTime(t, pattern), x, height - px(4f), label)
+                      }
+                  }
+
+                  // highlighted intervals (e.g. charging)
+                  if (marks.size == xs.size && xs.size > 1) {
+                      fill.shader = null
+                      fill.color = markColor
+                      for (i in 1 until xs.size) {
+                          if (marks[i - 1] && marks[i] && xs[i] - xs[i - 1] < gapMs) {
+                              cv.drawRect(xOf(xs[i - 1]), top, xOf(xs[i]), top + h, fill)
+                          }
+                      }
+                  }
+
+                  if (xs.size < 2) {
+                      label.textAlign = Paint.Align.CENTER
+                      label.textSize = px(12f)
+                      cv.drawText(emptyText, left + w / 2f, top + h / 2f, label)
+                      return
+                  }
+
+                  line.style = Paint.Style.STROKE
+                  line.strokeWidth = px(if (compact) 2f else 2.4f)
+                  line.strokeJoin = Paint.Join.ROUND
+                  line.strokeCap = Paint.Cap.ROUND
+                  line.color = color
+                  fill.color = 0xFFFFFFFF.toInt()
+                  fill.shader = LinearGradient(0f, top, 0f, top + h, (color and 0x00FFFFFF) or 0x66000000, color and 0x00FFFFFF, Shader.TileMode.CLAMP)
+
+                  var runStart = 0
+                  for (i in 1..xs.size) {
+                      val breakHere = i == xs.size || xs[i] - xs[i - 1] > gapMs
+                      if (breakHere) {
+                          if (i - runStart >= 2) {
+                              val path = Path()
+                              val area = Path()
+                              for (k in runStart until i) {
+                                  val x = xOf(xs[k])
+                                  val y = yOf(ys[k].coerceIn(minY, maxY))
+                                  if (k == runStart) {
+                                      path.moveTo(x, y); area.moveTo(x, top + h); area.lineTo(x, y)
+                                  } else {
+                                      path.lineTo(x, y); area.lineTo(x, y)
+                                  }
+                              }
+                              area.lineTo(xOf(xs[i - 1]), top + h)
+                              area.close()
+                              cv.drawPath(area, fill)
+                              cv.drawPath(path, line)
+                          } else {
+                              line.style = Paint.Style.FILL
+                              cv.drawCircle(xOf(xs[runStart]), yOf(ys[runStart].coerceIn(minY, maxY)), px(2.5f), line)
+                              line.style = Paint.Style.STROKE
+                          }
+                          runStart = i
+                      }
+                  }
+                  fill.shader = null
+              }
+          }
+
+          /** Vertical bar chart. */
+          class BarChartView(ctx: Context) : View(ctx) {
+              private var labels: List<String> = emptyList()
+              private var values: List<Float> = emptyList()
+              private var color = C.BLUE
+              private var colorHigh = C.AMBER
+              private var fmt: (Float) -> String = { fmt1(it) }
+              private var labelEvery = 1
+              var emptyText = "Пока нет данных"
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
+
+              fun setData(l: List<String>, v: List<Float>, col: Int, colHigh: Int, every: Int, f: (Float) -> String) {
+                  labels = l; values = v; color = col; colorHigh = colHigh; labelEvery = max(1, every); fmt = f
+                  invalidate()
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val top = px(16f)
+                  val bottom = px(18f)
+                  val h = height - top - bottom
+                  val n = values.size
+                  p.textSize = px(10f)
+                  p.textAlign = Paint.Align.CENTER
+                  if (n == 0 || values.all { it <= 0f }) {
+                      p.color = C.SUB
+                      p.textSize = px(12f)
+                      cv.drawText(emptyText, width / 2f, height / 2f, p)
+                      return
+                  }
+                  val maxV = values.maxOrNull() ?: 1f
+                  val slot = width.toFloat() / n
+                  val bw = slot * 0.62f
+                  val avg = values.filter { it > 0f }.average().toFloat()
+                  values.forEachIndexed { i, v ->
+                      val x = slot * i + (slot - bw) / 2f
+                      val bh = if (maxV > 0) h * v / maxV else 0f
+                      p.color = C.LINE
+                      rect.set(x, top, x + bw, top + h)
+                      cv.drawRoundRect(rect, bw / 3f, bw / 3f, p)
+                      if (bh > 0f) {
+                          p.color = if (v > avg * 1.6f) colorHigh else color
+                          rect.set(x, top + h - max(bh, px(3f)), x + bw, top + h)
+                          cv.drawRoundRect(rect, bw / 3f, bw / 3f, p)
+                      }
+                      if (v == maxV) {
+                          p.color = C.TEXT
+                          cv.drawText(fmt(v), x + bw / 2f, top + h - bh - px(4f), p)
+                      }
+                      if (i % labelEvery == 0 && i < labels.size) {
+                          p.color = C.SUB
+                          cv.drawText(labels[i], x + bw / 2f, height - px(4f), p)
+                      }
+                  }
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/Cleaner.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Environment
+          import android.os.StatFs
+          import java.io.File
+          import java.io.FileInputStream
+          import java.security.MessageDigest
+
+          class JunkItem(val file: File, val size: Long, var selected: Boolean, val note: String = "")
+
+          class JunkCategory(
+              val id: String,
+              val title: String,
+              val desc: String,
+              val color: Int,
+              val safe: Boolean
+          ) {
+              val items = ArrayList<JunkItem>()
+              var expanded = false
+              val total: Long get() = items.sumOf { it.size }
+              val selectedSize: Long get() = items.filter { it.selected }.sumOf { it.size }
+              val allSelected: Boolean get() = items.isNotEmpty() && items.all { it.selected }
+          }
+
+          object Cleaner {
+              private val TEMP_EXT = setOf("tmp", "temp", "bak", "old", "part", "crdownload", "chk", "gid", "~tmp")
+              private val LOG_EXT = setOf("log", "trace", "dmp", "dump", "anr", "hprof", "logcat", "xlog")
+              private val LOG_DIRS = setOf("debug_log", "logs", "log", "crash", "crashes", "tombstones", "bugreports", "mtklog", "miuilog", "offlinelog")
+              private val APK_EXT = setOf("apk", "apks", "xapk", "apkm")
+              private val PROTECTED_ROOT = setOf(
+                  "dcim", "download", "pictures", "music", "movies", "documents", "android",
+                  "alarms", "notifications", "podcasts", "ringtones", "recordings", "audiobooks", "miui"
+              )
+              private const val LARGE = 100L * 1024 * 1024
+              private const val OLD_DL_MS = 90L * 24 * 3_600_000L
+              private const val MAX_FILES = 400_000
+
+              fun hasAccess(): Boolean = Environment.isExternalStorageManager()
+
+              fun storage(): Pair<Long, Long> {
+                  val st = StatFs(Environment.getDataDirectory().path)
+                  return st.totalBytes to st.availableBytes
+              }
+
+              fun scan(ctx: Context, progress: (String, Int) -> Unit): List<JunkCategory> {
+                  val temp = JunkCategory("temp", "Временные файлы", "*.tmp, *.bak, недокачанные загрузки", C.MINT, true)
+                  val logs = JunkCategory("logs", "Логи и отчёты об ошибках", "Журналы приложений и системы, дампы сбоев", C.CYAN, true)
+                  val thumbs = JunkCategory("thumbs", "Кэш миниатюр", "Папки .thumbnails — пересоздаются автоматически", C.BLUE, true)
+                  val empty = JunkCategory("empty", "Пустые папки", "Папки без файлов, оставленные приложениями", C.VIOLET, true)
+                  val residual = JunkCategory("residual", "Остатки удалённых приложений", "Данные в Android/media от приложений, которых уже нет", C.AMBER, true)
+                  val apks = JunkCategory("apk", "Установочные APK", "Файлы установки, которые больше не нужны", 0xFFFF8A5B.toInt(), true)
+                  val dups = JunkCategory("dups", "Дубликаты", "Одинаковые файлы — оригинал (самый старый) сохраняется", C.RED, false)
+                  val large = JunkCategory("large", "Большие файлы (>100 МБ)", "Проверьте вручную, что они не нужны", 0xFFE36BFF.toInt(), false)
+                  val oldDl = JunkCategory("olddl", "Старые загрузки (>90 дней)", "Файлы в «Загрузках», к которым давно не обращались", 0xFF7AA2C9.toInt(), false)
+
+                  val root = Environment.getExternalStorageDirectory()
+                  val rootPath = root.absolutePath
+                  val skip = setOf("$rootPath/Android/data", "$rootPath/Android/obb")
+                  val downloadPath = File(root, "Download").absolutePath
+                  val now = System.currentTimeMillis()
+                  val sizeGroups = HashMap<Long, ArrayList<File>>()
+                  val residualPaths = HashSet<String>()
+                  val dirs = ArrayList<File>()
+
+                  val stack = ArrayDeque<File>()
+                  stack.add(root)
+                  var count = 0
+                  while (stack.isNotEmpty() && count < MAX_FILES) {
+                      val dir = stack.removeLast()
+                      val children = dir.listFiles() ?: continue
+                      if (dir != root) dirs.add(dir)
+                      for (f in children) {
+                          val path = f.absolutePath
+                          if (f.isDirectory) {
+                              if (path in skip || path in residualPaths) continue
+                              if (path == "$rootPath/Android/media") {
+                                  scanResidual(ctx, f, residual)
+                                  residual.items.forEach { residualPaths.add(it.file.absolutePath) }
+                              }
+                              stack.add(f)
+                              continue
+                          }
+                          count++
+                          if (count % 500 == 0) progress(path.removePrefix(rootPath), count)
+                          val size = f.length()
+                          val name = f.name.lowercase()
+                          val ext = name.substringAfterLast('.', "")
+                          val parentName = f.parentFile?.name?.lowercase() ?: ""
+                          val lowerPath = path.lowercase()
+                          when {
+                              lowerPath.contains("/.thumbnails/") -> thumbs.items.add(JunkItem(f, size, true))
+                              ext in TEMP_EXT || name.endsWith("~") || name.startsWith(".~") -> temp.items.add(JunkItem(f, size, true))
+                              ext in LOG_EXT || (parentName in LOG_DIRS && ext in setOf("txt", "gz", "zip", "")) ->
+                                  logs.items.add(JunkItem(f, size, true))
+                              ext in APK_EXT -> apks.items.add(JunkItem(f, size, true))
+                              size >= LARGE -> large.items.add(JunkItem(f, size, false))
+                              path.startsWith(downloadPath) && now - f.lastModified() > OLD_DL_MS ->
+                                  oldDl.items.add(JunkItem(f, size, false))
+                              else -> if (size >= 64 * 1024 && !path.startsWith("$rootPath/Android/")) {
+                                  sizeGroups.getOrPut(size) { ArrayList() }.add(f)
+                              }
+                          }
+                      }
+                  }
+
+                  // Empty folders (deepest first, so nested empty trees are found)
+                  progress("Поиск пустых папок…", count)
+                  val emptySet = HashSet<String>()
+                  for (d in dirs.sortedByDescending { it.absolutePath.length }) {
+                      val rel = d.absolutePath.removePrefix("$rootPath/")
+                      if (!rel.contains('/') && rel.lowercase() in PROTECTED_ROOT) continue
+                      if (rel.startsWith("Android/")) continue
+                      val kids = d.listFiles() ?: continue
+                      if (kids.all { it.isDirectory && it.absolutePath in emptySet }) {
+                          emptySet.add(d.absolutePath)
+                      }
+                  }
+                  // Only report top-most empty folders (deleting them removes nested ones)
+                  for (p in emptySet) {
+                      val parent = File(p).parent
+                      if (parent == null || parent !in emptySet) empty.items.add(JunkItem(File(p), 0L, true))
+                  }
+
+                  // Duplicates
+                  progress("Поиск дубликатов…", count)
+                  for ((size, files) in sizeGroups) {
+                      if (files.size < 2 || size > 512L * 1024 * 1024) continue
+                      val byHash = HashMap<String, ArrayList<File>>()
+                      for (f in files) {
+                          val h = hash(f) ?: continue
+                          byHash.getOrPut(h) { ArrayList() }.add(f)
+                      }
+                      for (group in byHash.values) {
+                          if (group.size < 2) continue
+                          val sorted = group.sortedBy { it.lastModified() }
+                          val original = sorted.first()
+                          for (copy in sorted.drop(1)) {
+                              dups.items.add(JunkItem(copy, size, false, "Копия: ${original.name}"))
+                          }
+                      }
+                  }
+
+                  val all = listOf(temp, logs, thumbs, empty, residual, apks, dups, large, oldDl)
+                  all.forEach { c -> c.items.sortByDescending { it.size } }
+                  return all
+              }
+
+              private fun scanResidual(ctx: Context, media: File, cat: JunkCategory) {
+                  val pm = ctx.packageManager
+                  val kids = media.listFiles() ?: return
+                  for (d in kids) {
+                      if (!d.isDirectory) continue
+                      val pkg = d.name
+                      if (!pkg.contains('.')) continue
+                      val installed = try {
+                          pm.getPackageInfo(pkg, 0); true
+                      } catch (e: PackageManager.NameNotFoundException) { false }
+                      if (!installed) cat.items.add(JunkItem(d, dirSize(d), true, pkg))
+                  }
+              }
+
+              fun dirSize(f: File): Long {
+                  if (f.isFile) return f.length()
+                  var total = 0L
+                  f.walkTopDown().forEach { if (it.isFile) total += it.length() }
+                  return total
+              }
+
+              private fun hash(f: File): String? = try {
+                  val md = MessageDigest.getInstance("MD5")
+                  FileInputStream(f).use { input ->
+                      val buf = ByteArray(64 * 1024)
+                      while (true) {
+                          val n = input.read(buf)
+                          if (n <= 0) break
+                          md.update(buf, 0, n)
+                      }
+                  }
+                  md.digest().joinToString("") { "%02x".format(it) }
+              } catch (e: Throwable) { null }
+
+              /** Deletes the selected items. Returns (deleted count, freed bytes). */
+              fun clean(cats: List<JunkCategory>): Pair<Int, Long> {
+                  var n = 0
+                  var freed = 0L
+                  for (c in cats) {
+                      val it = c.items.iterator()
+                      while (it.hasNext()) {
+                          val item = it.next()
+                          if (!item.selected) continue
+                          val ok = if (item.file.isDirectory) item.file.deleteRecursively() else item.file.delete()
+                          if (ok || !item.file.exists()) {
+                              n++; freed += item.size; it.remove()
+                          }
+                      }
+                  }
+                  return n to freed
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/CleanerScreen.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.content.Intent
+          import android.os.storage.StorageManager
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class CleanerScreen(a: MainActivity) : Screen(a) {
+              private lateinit var body: LinearLayout
+              private var cats: List<JunkCategory>? = null
+              private var scanning = false
+              private var lastResult: String? = null
+              private var progressTv: TextView? = null
+              private var footerTv: TextView? = null
+
+              override fun build(): View {
+                  val (sv, col) = page("Очистка", "Глубокий поиск мусора во внутренней памяти")
+                  body = col.add(a.vbox())
+                  return sv
+              }
+
+              override fun onShow() { render() }
+
+              private fun render() {
+                  body.removeAllViews()
+                  progressTv = null
+                  footerTv = null
+
+                  // Storage donut
+                  val (total, free) = Cleaner.storage()
+                  val used = total - free
+                  val junk = cats?.sumOf { it.total } ?: 0L
+                  val sc = a.card()
+                  val r = a.hbox()
+                  val donut = DonutView(a)
+                  donut.set(
+                      listOf((used - junk).toFloat() to C.VIOLET, junk.toFloat() to C.AMBER, free.toFloat() to C.LINE),
+                      "${used * 100 / total}%", "занято"
+                  )
+                  r.add(donut, a.dp(120), a.dp(120))
+                  val legend = a.vbox()
+                  legend.add(legendRow(C.VIOLET, "Занято", fmtBytes(used - junk)))
+                  if (junk > 0) legend.add(legendRow(C.AMBER, "Найден мусор", fmtBytes(junk)), top = 8)
+                  legend.add(legendRow(C.LINE, "Свободно", fmtBytes(free)), top = 8)
+                  legend.add(a.text("Всего ${fmtBytes(total)}", 12f, C.SUB), top = 8)
+                  r.add(legend, 0, WRAP, 1f, start = 16)
+                  sc.add(r)
+                  body.add(sc, top = 10)
+
+                  lastResult?.let {
+                      val rc = a.card(0xFF12352C.toInt())
+                      rc.add(a.text("✓ $it", 15f, C.MINT, true))
+                      body.add(rc, top = 12)
+                  }
+
+                  // System cache
+                  body.add(a.sectionTitle("Кэш всех приложений"))
+                  val cc = a.card()
+                  cc.add(a.text("Системная очистка кэша", 15f, C.TEXT, true))
+                  cc.add(a.text("Официальный способ Android 11+: система удаляет кэш всех приложений сразу (после подтверждения). Данные и вход в аккаунты сохраняются.", 12.5f, C.SUB), top = 4)
+                  cc.add(a.pill("Очистить кэш приложений", C.CYAN) { clearAppCache() }, WRAP, WRAP, top = 12)
+                  body.add(cc)
+
+                  // File scan
+                  body.add(a.sectionTitle("Глубокое сканирование"))
+                  if (!Perms.storage()) {
+                      val pc = a.card(0xFF2A2140.toInt())
+                      pc.add(a.text("Нужен доступ ко всем файлам", 15f, C.TEXT, true))
+                      pc.add(a.text("Без него Android не позволяет найти временные файлы, логи, дубликаты и остатки удалённых приложений. VoltGuard ничего не отправляет в интернет — у приложения даже нет такого разрешения.", 12.5f, C.SUB), top = 4)
+                      pc.add(a.pill("Разрешить доступ", C.VIOLET) { Perms.requestStorage(a) }, WRAP, WRAP, top = 12)
+                      body.add(pc)
+                      return
+                  }
+
+                  if (scanning) {
+                      val pc = a.card()
+                      pc.add(a.text("Сканирование…", 16f, C.TEXT, true))
+                      progressTv = pc.add(a.text("Подготовка", 12f, C.SUB).apply { maxLines = 2 }, top = 6)
+                      body.add(pc)
+                      return
+                  }
+
+                  val list = cats
+                  if (list == null) {
+                      val pc = a.card()
+                      pc.add(a.text("Найдём: временные файлы, логи, кэш миниатюр, пустые папки, остатки удалённых приложений, старые APK, дубликаты, большие и давно забытые файлы.", 13f, C.SUB))
+                      pc.add(a.pill("Начать сканирование", C.MINT) { scan() }, MATCH, WRAP, top = 14)
+                      body.add(pc)
+                      return
+                  }
+
+                  for (c in list) body.add(categoryCard(c), bottom = 10)
+
+                  val foot = a.card(C.CARD2)
+                  footerTv = foot.add(a.text("", 14f, C.TEXT, true))
+                  updateFooter()
+                  val br = a.hbox()
+                  br.add(a.pill("Пересканировать", C.BLUE, filled = false) { cats = null; scan() }, 0, WRAP, 1f, end = 5)
+                  br.add(a.pill("Очистить", C.MINT) { confirmClean() }, 0, WRAP, 1f, start = 5)
+                  foot.add(br, top = 12)
+                  body.add(foot, top = 4)
+                  body.add(a.text("Категории с красной/серой меткой не выбраны автоматически — проверьте их содержимое перед удалением.", 11.5f, C.SUB), top = 10)
+              }
+
+              private fun legendRow(color: Int, label: String, value: String): LinearLayout {
+                  val r = a.hbox()
+                  r.add(View(a).apply { background = a.rounded(color, 4f) }, a.dp(10), a.dp(10))
+                  r.add(a.text(label, 12.5f, C.SUB), 0, WRAP, 1f, start = 8)
+                  r.add(a.text(value, 13f, C.TEXT, true), WRAP, WRAP)
+                  return r
+              }
+
+              private fun updateFooter() {
+                  val list = cats ?: return
+                  val size = list.sumOf { it.selectedSize }
+                  val n = list.sumOf { c -> c.items.count { it.selected } }
+                  footerTv?.text = "Выбрано: ${fmtBytes(size)} · объектов: $n"
+              }
+
+              private fun checkBox(checked: Boolean, color: Int): TextView =
+                  a.text(if (checked) "✓" else "", 14f, 0xFF06121A.toInt(), true).apply {
+                      gravity = Gravity.CENTER
+                      background = if (checked) a.rounded(color, 7f) else a.rounded(0x00000000, 7f, C.SUB)
+                  }
+
+              private fun categoryCard(c: JunkCategory): LinearLayout {
+                  val card = a.card()
+                  val head = a.hbox()
+                  val cb = checkBox(c.allSelected, c.color)
+                  head.add(cb, a.dp(24), a.dp(24))
+                  val tt = a.vbox()
+                  tt.add(a.text(c.title, 14.5f, C.TEXT, true))
+                  tt.add(a.text("${c.items.size} шт. · ${fmtBytes(c.total)}" + if (!c.safe) " · проверьте вручную" else "", 12f, if (c.safe) C.SUB else C.AMBER))
+                  head.add(tt, 0, WRAP, 1f, start = 12)
+                  val arrow = head.add(a.text(if (c.expanded) "▲" else "▼", 13f, C.SUB), WRAP, WRAP, start = 8)
+                  card.add(head)
+                  card.add(a.text(c.desc, 12f, C.SUB), top = 6)
+
+                  cb.setOnClickListener {
+                      val v = !c.allSelected
+                      c.items.forEach { it.selected = v }
+                      render()
+                  }
+                  val toggle = View.OnClickListener {
+                      if (c.items.isNotEmpty()) { c.expanded = !c.expanded; render() }
+                  }
+                  tt.setOnClickListener(toggle)
+                  arrow.setOnClickListener(toggle)
+
+                  if (c.expanded) {
+                      val root = android.os.Environment.getExternalStorageDirectory().absolutePath
+                      val shown = c.items.take(150)
+                      for (item in shown) {
+                          val row = a.hbox().apply { setPadding(0, a.dp(8), 0, 0) }
+                          val icb = checkBox(item.selected, c.color)
+                          row.add(icb, a.dp(20), a.dp(20))
+                          val info = a.vbox()
+                          info.add(a.text(item.file.name, 12.5f, C.TEXT).apply { maxLines = 1 })
+                          val sub = (if (item.note.isNotEmpty()) item.note + " · " else "") + item.file.parent.orEmpty().removePrefix(root)
+                          info.add(a.text(sub, 10.5f, C.SUB).apply { maxLines = 1 })
+                          row.add(info, 0, WRAP, 1f, start = 10)
+                          row.add(a.text(fmtBytes(item.size), 11.5f, C.SUB), WRAP, WRAP, start = 6)
+                          row.setOnClickListener {
+                              item.selected = !item.selected
+                              icb.text = if (item.selected) "✓" else ""
+                              icb.background = if (item.selected) a.rounded(c.color, 7f) else a.rounded(0x00000000, 7f, C.SUB)
+                              cb.text = if (c.allSelected) "✓" else ""
+                              cb.background = if (c.allSelected) a.rounded(c.color, 7f) else a.rounded(0x00000000, 7f, C.SUB)
+                              updateFooter()
+                          }
+                          card.add(row)
+                      }
+                      if (c.items.size > shown.size) {
+                          card.add(a.text("…и ещё ${c.items.size - shown.size}", 11.5f, C.SUB), top = 6)
+                      }
+                  }
+                  return card
+              }
+
+              private fun scan() {
+                  scanning = true
+                  lastResult = null
+                  render()
+                  bg({
+                      Cleaner.scan(a) { path, n ->
+                          a.handler.post { progressTv?.text = "Проверено файлов: $n\n$path" }
+                      }
+                  }) { result ->
+                      scanning = false
+                      cats = result
+                      render()
+                  }
+              }
+
+              private fun confirmClean() {
+                  val list = cats ?: return
+                  val size = list.sumOf { it.selectedSize }
+                  if (size == 0L && list.none { c -> c.items.any { it.selected } }) {
+                      a.toast("Ничего не выбрано"); return
+                  }
+                  android.app.AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setTitle("Удалить выбранное?")
+                      .setMessage("Будет освобождено ${fmtBytes(size)}. Удалённые файлы нельзя восстановить.")
+                      .setPositiveButton("Удалить") { _, _ -> clean() }
+                      .setNegativeButton("Отмена", null)
+                      .show()
+              }
+
+              private fun clean() {
+                  val list = cats ?: return
+                  a.toast("Очистка…")
+                  bg({ Cleaner.clean(list) }) { (n, freed) ->
+                      lastResult = "Удалено объектов: $n · освобождено ${fmtBytes(freed)}"
+                      render()
+                  }
+              }
+
+              private fun clearAppCache() {
+                  if (!Perms.storage()) {
+                      a.toast("Сначала разрешите доступ ко всем файлам")
+                      Perms.requestStorage(a)
+                      return
+                  }
+                  try {
+                      @Suppress("DEPRECATION")
+                      a.startActivityForResult(Intent(StorageManager.ACTION_CLEAR_APP_CACHE), 77)
+                  } catch (e: Throwable) {
+                      a.toast("Система не поддерживает: откройте Настройки → Хранилище")
+                      a.openFirst(Intent(android.provider.Settings.ACTION_INTERNAL_STORAGE_SETTINGS))
+                  }
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/MainActivity.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowInsets
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          abstract class Screen(val a: MainActivity) {
+              val view: View by lazy { build() }
+              protected abstract fun build(): View
+              open fun onShow() {}
+              open fun onHide() {}
+
+              /** Standard scrollable page with a title. Returns (scroll view, content column). */
+              protected fun page(title: String, subtitle: String): Pair<ScrollView, LinearLayout> {
+                  val sv = ScrollView(a).apply { isFillViewport = true; isVerticalScrollBarEnabled = false }
+                  val col = a.vbox().apply { setPadding(a.dp(16), a.dp(12), a.dp(16), a.dp(24)) }
+                  col.add(a.text(title, 28f, C.TEXT, true).apply { typeface = BLACK })
+                  col.add(a.text(subtitle, 13f, C.SUB), top = 2, bottom = 6)
+                  sv.addView(col)
+                  return sv to col
+              }
+          }
+
+          class MainActivity : Activity() {
+              private lateinit var content: FrameLayout
+              private val screens = ArrayList<Screen>()
+              private val tabs = ArrayList<Pair<TextView, TextView>>()
+              private var current = -1
+              val handler = Handler(Looper.getMainLooper())
+
+              lateinit var apps: AppsScreen
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = vbox().apply { setBackgroundColor(C.BG) }
+                  content = FrameLayout(this)
+                  root.add(content, MATCH, 0, 1f)
+                  val nav = hbox().apply {
+                      setBackgroundColor(C.NAV)
+                      setPadding(dp(4), dp(6), dp(4), dp(6))
+                  }
+                  root.add(nav)
+                  root.setOnApplyWindowInsetsListener { v, insets ->
+                      val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                      v.setPadding(bars.left, bars.top, bars.right, 0)
+                      nav.setPadding(dp(4), dp(6), dp(4), dp(6) + bars.bottom)
+                      insets
+                  }
+                  setContentView(root)
+
+                  apps = AppsScreen(this)
+                  screens += OverviewScreen(this)
+                  screens += BatteryScreen(this)
+                  screens += SaverScreen(this)
+                  screens += CleanerScreen(this)
+                  screens += apps
+
+                  val items = listOf("◉" to "Обзор", "ϟ" to "Батарея", "❖" to "Экономия", "✦" to "Очистка", "▦" to "Приложения")
+                  items.forEachIndexed { i, (icon, label) ->
+                      val cell = vbox().apply {
+                          gravity = Gravity.CENTER
+                          setPadding(0, dp(4), 0, dp(4))
+                          setOnClickListener { select(i) }
+                      }
+                      val ic = cell.add(text(icon, 18f, C.SUB, true).apply { gravity = Gravity.CENTER }, WRAP, WRAP)
+                      val tx = cell.add(text(label, 10.5f, C.SUB, true).apply { gravity = Gravity.CENTER; maxLines = 1 }, WRAP, WRAP)
+                      nav.add(cell, 0, WRAP, 1f)
+                      tabs += ic to tx
+                  }
+
+                  Sampler.schedule(this)
+                  bgRun { Sampler.record(applicationContext) }
+                  select(0)
+              }
+
+              fun select(i: Int) {
+                  if (i == current) { screens[i].onShow(); return }
+                  if (current >= 0) screens[current].onHide()
+                  current = i
+                  content.removeAllViews()
+                  val v = screens[i].view
+                  (v.parent as? FrameLayout)?.removeView(v)
+                  content.addView(v, FrameLayout.LayoutParams(MATCH, MATCH))
+                  tabs.forEachIndexed { k, (ic, tx) ->
+                      val col = if (k == i) C.MINT else C.SUB
+                      ic.setTextColor(col); tx.setTextColor(col)
+                  }
+                  screens[i].onShow()
+              }
+
+              fun refresh() {
+                  if (current >= 0) screens[current].onShow()
+              }
+
+              fun showApps(filter: Int) {
+                  apps.filter = filter
+                  select(4)
+              }
+
+              fun speedUpAnimations() {
+                  if (Perms.secure(this)) {
+                      val ok = Booster.setAnimScale(this, 0.5f)
+                      toast(if (ok) "Анимации ускорены до 0.5x" else "Не удалось изменить анимации")
+                      refresh()
+                      return
+                  }
+                  val cmd = Perms.adbCommand(this)
+                  AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setTitle("Нужно разовое разрешение")
+                      .setMessage(
+                          "Android разрешает менять скорость анимаций только приложениям с особым разрешением. " +
+                              "Его можно выдать один раз с компьютера через ADB:\n\n$cmd\n\n" +
+                              "Или вручную: Настройки → О телефоне → 7 раз нажмите «Версия ОС» → " +
+                              "Расширенные настройки → Для разработчиков → три пункта «Анимация» → 0.5x."
+                      )
+                      .setPositiveButton("Копировать команду") { _, _ ->
+                          getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("adb", cmd))
+                          toast("Команда скопирована")
+                      }
+                      .setNeutralButton("Для разработчиков") { _, _ ->
+                          openFirst(Intent(android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                      }
+                      .setNegativeButton("Закрыть", null)
+                      .show()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (current >= 0) screens[current].onShow()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  if (current >= 0) screens[current].onHide()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (current >= 0) screens[current].onShow()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (current > 0) select(0) else super.onBackPressed()
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/OverviewScreen.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.os.Build
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+
+          class OverviewScreen(a: MainActivity) : Screen(a) {
+              private lateinit var col: LinearLayout
+              private lateinit var dynamic: LinearLayout
+              private lateinit var ring: RingView
+              private lateinit var statusTv: TextView
+              private lateinit var leftTv: TextView
+              private lateinit var metaTv: TextView
+              private var drain: DrainStats? = null
+              private val tick = object : Runnable {
+                  override fun run() { updateLive(); a.handler.postDelayed(this, 3000) }
+              }
+
+              override fun build(): View {
+                  val (sv, c) = page("VoltGuard", "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}")
+                  col = c
+
+                  // Hero battery card
+                  val hero = a.vbox().apply {
+                      background = a.gradient(0xFF14324A.toInt(), 0xFF141A28.toInt(), 24f)
+                      setPadding(a.dp(18), a.dp(18), a.dp(18), a.dp(18))
+                  }
+                  val row = a.hbox()
+                  ring = RingView(a)
+                  row.add(ring, a.dp(132), a.dp(132))
+                  val info = a.vbox()
+                  statusTv = info.add(a.text("", 13f, C.MINT, true))
+                  leftTv = info.add(a.text("", 22f, C.TEXT, true).apply { typeface = BLACK }, top = 4)
+                  metaTv = info.add(a.text("", 12.5f, C.SUB), top = 6)
+                  row.add(info, 0, WRAP, 1f, start = 16)
+                  hero.add(row)
+                  col.add(hero, top = 10)
+
+                  dynamic = col.add(a.vbox())
+                  return sv
+              }
+
+              override fun onShow() {
+                  updateLive()
+                  a.handler.removeCallbacks(tick)
+                  a.handler.postDelayed(tick, 3000)
+                  render()
+              }
+
+              override fun onHide() {
+                  a.handler.removeCallbacks(tick)
+              }
+
+              private fun updateLive() {
+                  val b = Battery.read(a)
+                  val col1 = when {
+                      b.charging -> C.MINT
+                      b.pct <= 20 -> C.RED
+                      b.pct <= 40 -> C.AMBER
+                      else -> C.MINT
+                  }
+                  ring.set(b.pct / 100f, col1, C.BLUE, "${b.pct.toInt()}%", if (b.charging) "заряд" else "батарея")
+                  statusTv.text = if (b.charging) "⚡ Заряжается · ${b.plugText}" else "Работа от батареи"
+                  statusTv.setTextColor(if (b.charging) C.MINT else C.SUB)
+                  val d = drain
+                  leftTv.text = if (b.charging) {
+                      if (b.chargeTimeRemainingMs > 0) "до 100%: ${fmtDuration(b.chargeTimeRemainingMs)}" else "Заряжается"
+                  } else {
+                      val h = if (d != null) Analysis.hoursLeft(b, d) else null
+                      if (h != null) "≈ ${fmtHours(h)}" else "Расчёт…"
+                  }
+                  metaTv.text = "${fmt1(b.tempC)}°C  ·  ${abs(b.currentMa)} мА  ·  ${fmt2(b.powerW)} Вт\n" +
+                      "Напряжение ${fmt2(b.voltageMv / 1000f)} В"
+              }
+
+              private fun render() {
+                  bg({
+                      val now = System.currentTimeMillis()
+                      val hist = History.load(a, now - 24 * 3_600_000L)
+                      val unr = Apps.unrestrictedCount(a)
+                      Triple(hist, unr, Booster.mem(a))
+                  }) { (hist, unr, mem) ->
+                      drain = Analysis.drain(hist)
+                      updateLive()
+                      fill(hist, unr, mem)
+                  }
+              }
+
+              private fun fill(hist: List<Sample>, unr: Int, mem: android.app.ActivityManager.MemoryInfo) {
+                  dynamic.removeAllViews()
+                  val d = drain ?: return
+                  val now = System.currentTimeMillis()
+
+                  // Permissions
+                  val missing = ArrayList<Triple<String, String, () -> Unit>>()
+                  if (!Perms.usage(a)) missing += Triple("Доступ к истории использования", "Анализ приложений, разряжающих батарею", { Perms.requestUsage(a); Unit })
+                  if (!Perms.storage()) missing += Triple("Доступ ко всем файлам", "Глубокая очистка мусора", { Perms.requestStorage(a); Unit })
+                  if (!Perms.writeSettings(a)) missing += Triple("Изменение системных настроек", "Профили экономии в одно касание", { Perms.requestWrite(a); Unit })
+                  if (missing.isNotEmpty()) {
+                      val pc = a.card(0xFF2A2140.toInt())
+                      pc.add(a.text("Выдайте разрешения для полной работы", 15f, C.TEXT, true))
+                      for ((t, s, act) in missing) {
+                          val r = a.hbox()
+                          val txt = a.vbox()
+                          txt.add(a.text(t, 13.5f, C.TEXT, true))
+                          txt.add(a.text(s, 12f, C.SUB))
+                          r.add(txt, 0, WRAP, 1f)
+                          r.add(a.pill("Выдать", C.VIOLET) { act() }, WRAP, WRAP, start = 8)
+                          pc.add(r, top = 12)
+                      }
+                      dynamic.add(pc, top = 12)
+                  }
+
+                  // Optimization score
+                  val checks = Checks.all(a, unr)
+                  val score = Checks.score(checks)
+                  val sc = a.card()
+                  val sr = a.hbox()
+                  val sring = RingView(a).apply { strokeDp = 9f }
+                  val scol = when { score >= 80 -> C.MINT; score >= 50 -> C.AMBER; else -> C.RED }
+                  sring.set(score / 100f, scol, C.VIOLET, "$score", "из 100")
+                  sr.add(sring, a.dp(92), a.dp(92))
+                  val st = a.vbox()
+                  st.add(a.text("Оптимизация энергии", 16f, C.TEXT, true))
+                  val bad = checks.count { it.ok == false }
+                  st.add(a.text(if (bad == 0) "Всё настроено оптимально" else "Можно улучшить пунктов: $bad", 13f, C.SUB), top = 2)
+                  st.add(a.pill(if (bad == 0) "Подробнее" else "Исправить", scol) { a.select(2) }, WRAP, WRAP, top = 10)
+                  sr.add(st, 0, WRAP, 1f, start = 16)
+                  sc.add(sr)
+                  dynamic.add(sc, top = 12)
+
+                  // Quick actions
+                  dynamic.add(a.sectionTitle("Быстрые действия"))
+                  val qa = listOf(
+                      Triple("⚡", "Ускорить", C.BLUE) to { boost() },
+                      Triple("✦", "Очистка", C.MINT) to { a.select(3) },
+                      Triple("❖", "Энергосбережение", C.AMBER) to { Checks.batterySaver(a); Unit },
+                      Triple("☾", "Профиль «Макс.»", C.VIOLET) to { a.toast(Checks.applyProfile(a, true)); a.refresh() }
+                  )
+                  val tiles = qa.map { (meta, act) ->
+                      val (ic, label, color) = meta
+                      a.vbox().apply {
+                          background = a.rounded(C.CARD, 18f)
+                          setPadding(a.dp(14), a.dp(14), a.dp(14), a.dp(14))
+                          add(a.text(ic, 22f, color, true))
+                          add(a.text(label, 13.5f, C.TEXT, true), top = 6)
+                          setOnClickListener { act() }
+                      }
+                  }
+                  dynamic.add(a.grid(tiles, 2))
+
+                  // Resources
+                  dynamic.add(a.sectionTitle("Ресурсы"))
+                  val usedRam = mem.totalMem - mem.availMem
+                  val (total, free) = Cleaner.storage()
+                  val res = a.card()
+                  res.add(resourceRow("Оперативная память", "${fmtBytes(usedRam)} из ${fmtBytes(mem.totalMem)}", usedRam.toFloat() / mem.totalMem, C.BLUE))
+                  res.add(resourceRow("Хранилище", "${fmtBytes(total - free)} из ${fmtBytes(total)}", (total - free).toFloat() / total, C.VIOLET), top = 14)
+                  dynamic.add(res)
+
+                  // Idle drain
+                  dynamic.add(a.sectionTitle("Разряд за 24 часа"))
+                  val dc = a.card()
+                  val (verdict, vcol) = Analysis.idleVerdict(d.idleRate)
+                  val tiles2 = listOf(
+                      a.statTile("В покое (экран выкл.)", d.idleRate?.let { "${fmt2(it)} %/ч" } ?: "—", vcol).first,
+                      a.statTile("Активное использование", d.activeRate?.let { "${fmt1(it)} %/ч" } ?: "—", C.CYAN).first
+                  )
+                  dc.add(a.grid(tiles2, 2))
+                  dc.add(a.text("Оценка разряда в покое: $verdict", 13f, vcol, true), top = 10)
+                  val spark = LineChartView(a).apply { compact = true; emptyText = "Данные появятся через ~30 минут" }
+                  spark.setData(hist.map { it.t }, hist.map { it.pct }, 0f, 100f, now - 24 * 3_600_000L, now, C.MINT, "%", hist.map { it.charging })
+                  dc.add(spark, MATCH, a.dp(70), top = 12)
+                  dc.setOnClickListener { a.select(1) }
+                  dynamic.add(dc)
+
+                  dynamic.add(a.text("VoltGuard не работает постоянно в фоне: замер раз в 15 минут через системный планировщик, это практически не расходует батарею.", 11.5f, C.SUB).apply {
+                      gravity = Gravity.CENTER
+                  }, top = 16)
+              }
+
+              private fun resourceRow(title: String, value: String, frac: Float, color: Int): LinearLayout {
+                  val box = a.vbox()
+                  val r = a.hbox()
+                  r.add(a.text(title, 13.5f, C.TEXT, true), 0, WRAP, 1f)
+                  r.add(a.text(value, 12.5f, C.SUB), WRAP, WRAP)
+                  box.add(r)
+                  box.add(MiniBar(a).apply { fraction = frac; this.color = color }, MATCH, a.dp(8), top = 8)
+                  return box
+              }
+
+              private fun boost() {
+                  a.toast("Оптимизация памяти…")
+                  bg({
+                      val before = Booster.mem(a).availMem
+                      val n = Booster.boost(a)
+                      Thread.sleep(1500)
+                      val after = Booster.mem(a).availMem
+                      n to (after - before)
+                  }) { (n, freed) ->
+                      a.toast(
+                          if (freed > 8L * 1024 * 1024) "Освобождено ${fmtBytes(freed)} · обработано приложений: $n"
+                          else "Память уже в оптимальном состоянии (проверено приложений: $n)"
+                      )
+                      render()
+                  }
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/SaverScreen.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.LinearLayout
+
+          class SaverScreen(a: MainActivity) : Screen(a) {
+              private lateinit var body: LinearLayout
+
+              override fun build(): View {
+                  val (sv, col) = page("Экономия", "Настройки, которые реально снижают расход — в том числе в покое")
+                  body = col.add(a.vbox())
+                  return sv
+              }
+
+              override fun onShow() {
+                  bg({ Apps.unrestrictedCount(a) }) { unr -> render(unr) }
+              }
+
+              private fun render(unr: Int) {
+                  body.removeAllViews()
+                  val checks = Checks.all(a, unr)
+                  val score = Checks.score(checks)
+
+                  // Score header
+                  val head = a.vbox().apply {
+                      background = a.gradient(0xFF2A1F4A.toInt(), 0xFF141A28.toInt(), 24f)
+                      setPadding(a.dp(18), a.dp(18), a.dp(18), a.dp(18))
+                  }
+                  val hr = a.hbox()
+                  val ring = RingView(a).apply { strokeDp = 10f }
+                  val col = when { score >= 80 -> C.MINT; score >= 50 -> C.AMBER; else -> C.RED }
+                  ring.set(score / 100f, col, C.VIOLET, "$score", "баллов")
+                  hr.add(ring, a.dp(110), a.dp(110))
+                  val ht = a.vbox()
+                  ht.add(a.text("Энергоэффективность", 17f, C.TEXT, true))
+                  val good = checks.count { it.ok == true }
+                  val total = checks.count { it.ok != null }
+                  ht.add(a.text("Оптимально: $good из $total ключевых настроек", 13f, C.SUB), top = 4)
+                  hr.add(ht, 0, WRAP, 1f, start = 16)
+                  head.add(hr)
+                  body.add(head, top = 10)
+
+                  // Profiles
+                  body.add(a.sectionTitle("Профили в одно касание"))
+                  val prof = a.hbox()
+                  prof.add(profileCard("☾", "Максимальная\nэкономия", "Тайм-аут 15 с, синхронизация и вибро-отклик выкл., автояркость", C.VIOLET) {
+                      a.toast(Checks.applyProfile(a, true)); onShow()
+                  }, 0, WRAP, 1f, end = 5)
+                  prof.add(profileCard("◐", "Сбалансированный\nрежим", "Тайм-аут 1 мин, синхронизация вкл., автояркость", C.CYAN) {
+                      a.toast(Checks.applyProfile(a, false)); onShow()
+                  }, 0, WRAP, 1f, start = 5)
+                  body.add(prof)
+                  if (!Perms.writeSettings(a)) {
+                      body.add(a.text("Для профилей нужно разрешение «Изменение системных настроек» — его попросят при первом нажатии.", 12f, C.SUB), top = 8)
+                  }
+
+                  // Checklist
+                  body.add(a.sectionTitle("Проверка настроек"))
+                  val sorted = checks.sortedBy { when (it.ok) { false -> 0; null -> 2; true -> 1 } }
+                  for (c in sorted) body.add(checkRow(c), bottom = 10)
+
+                  // Animations
+                  body.add(a.sectionTitle("Скорость интерфейса"))
+                  val an = a.card()
+                  val cur = Booster.animScale(a)
+                  an.add(a.text("Сейчас: ${fmt1(cur)}x", 15f, C.TEXT, true))
+                  an.add(a.text("Чем меньше значение, тем быстрее открываются окна и приложения.", 12.5f, C.SUB), top = 2)
+                  val chips = a.hbox()
+                  listOf(0f to "Выкл", 0.5f to "0.5x", 1f to "1x").forEach { (v, l) ->
+                      chips.add(a.chip(l, kotlin.math.abs(cur - v) < 0.01f) {
+                          if (Perms.secure(a)) {
+                              Booster.setAnimScale(a, v); onShow()
+                          } else a.speedUpAnimations()
+                      }, WRAP, WRAP, end = 8)
+                  }
+                  an.add(chips, top = 10)
+                  if (!Perms.secure(a)) {
+                      an.add(a.text("Требуется разовое разрешение через ADB — нажмите на любой вариант, чтобы увидеть инструкцию.", 11.5f, C.SUB), top = 8)
+                  }
+                  body.add(an)
+              }
+
+              private fun profileCard(icon: String, title: String, desc: String, color: Int, onClick: () -> Unit): LinearLayout =
+                  a.vbox().apply {
+                      background = a.rounded(C.CARD, 20f, color)
+                      setPadding(a.dp(14), a.dp(14), a.dp(14), a.dp(14))
+                      add(a.text(icon, 24f, color, true))
+                      add(a.text(title, 14f, C.TEXT, true), top = 6)
+                      add(a.text(desc, 11.5f, C.SUB), top = 4)
+                      add(a.text("Применить", 13f, color, true), top = 10)
+                      setOnClickListener { onClick() }
+                  }
+
+              private fun checkRow(c: Check): LinearLayout {
+                  val card = a.card()
+                  val top = a.hbox()
+                  val (dot, dotColor) = when (c.ok) {
+                      true -> "✓" to C.MINT
+                      false -> "!" to C.AMBER
+                      null -> "i" to C.BLUE
+                  }
+                  top.add(a.text(dot, 14f, 0xFF06121A.toInt(), true).apply {
+                      gravity = Gravity.CENTER
+                      background = a.rounded(dotColor, 10f)
+                  }, a.dp(26), a.dp(26))
+                  val tt = a.vbox()
+                  tt.add(a.text(c.title, 14.5f, C.TEXT, true))
+                  tt.add(a.text(c.state, 12.5f, dotColor, true))
+                  top.add(tt, 0, WRAP, 1f, start = 12)
+                  val act = c.action
+                  if (c.actionLabel != null && act != null) {
+                      top.add(a.pill(c.actionLabel, dotColor, filled = c.ok == false) { act() }, WRAP, WRAP, start = 8)
+                  }
+                  card.add(top)
+                  card.add(a.text(c.desc, 12.5f, C.SUB), top = 8)
+                  return card
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/SystemTools.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.app.ActivityManager
+          import android.app.AppOpsManager
+          import android.app.usage.UsageStatsManager
+          import android.content.ComponentName
+          import android.content.ContentResolver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.graphics.drawable.Drawable
+          import android.location.LocationManager
+          import android.net.Uri
+          import android.nfc.NfcAdapter
+          import android.os.PowerManager
+          import android.os.Process
+          import android.provider.Settings
+
+          /** Opens the first intent that resolves. Returns true on success. */
+          fun Context.openFirst(vararg intents: Intent): Boolean {
+              for (i in intents) {
+                  try {
+                      if (this !is android.app.Activity) i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(i)
+                      return true
+                  } catch (e: Throwable) {
+                      // try next
+                  }
+              }
+              toast("Не удалось открыть настройки на этом устройстве")
+              return false
+          }
+
+          fun comp(pkg: String, cls: String): Intent = Intent().setComponent(ComponentName(pkg, cls))
+
+          fun Context.appDetails(pkg: String) =
+              openFirst(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$pkg")))
+
+          object Perms {
+              fun usage(ctx: Context): Boolean {
+                  val ops = ctx.getSystemService(AppOpsManager::class.java) ?: return false
+                  val mode = ops.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), ctx.packageName)
+                  return mode == AppOpsManager.MODE_ALLOWED
+              }
+
+              fun storage(): Boolean = Cleaner.hasAccess()
+              fun writeSettings(ctx: Context): Boolean = Settings.System.canWrite(ctx)
+              fun secure(ctx: Context): Boolean =
+                  ctx.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == PackageManager.PERMISSION_GRANTED
+
+              fun requestUsage(ctx: Context) = ctx.openFirst(
+                  Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, Uri.parse("package:${ctx.packageName}")),
+                  Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+              )
+
+              fun requestStorage(ctx: Context) = ctx.openFirst(
+                  Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${ctx.packageName}")),
+                  Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+              )
+
+              fun requestWrite(ctx: Context) = ctx.openFirst(
+                  Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+              )
+
+              fun adbCommand(ctx: Context) = "adb shell pm grant ${ctx.packageName} android.permission.WRITE_SECURE_SETTINGS"
+          }
+
+          object Booster {
+              fun mem(ctx: Context): ActivityManager.MemoryInfo {
+                  val am = ctx.getSystemService(ActivityManager::class.java)
+                  val mi = ActivityManager.MemoryInfo()
+                  am?.getMemoryInfo(mi)
+                  return mi
+              }
+
+              /** Asks the system to stop cached background processes of user apps. Returns number of apps processed. */
+              fun boost(ctx: Context): Int {
+                  val am = ctx.getSystemService(ActivityManager::class.java) ?: return 0
+                  val pm = ctx.packageManager
+                  var n = 0
+                  for (app in pm.getInstalledApplications(0)) {
+                      if (app.packageName == ctx.packageName) continue
+                      if ((app.flags and ApplicationInfo.FLAG_SYSTEM) != 0) continue
+                      try { am.killBackgroundProcesses(app.packageName); n++ } catch (e: Throwable) { }
+                  }
+                  System.gc()
+                  return n
+              }
+
+              fun animScale(ctx: Context): Float =
+                  Settings.Global.getFloat(ctx.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f)
+
+              fun setAnimScale(ctx: Context, v: Float): Boolean = try {
+                  val cr = ctx.contentResolver
+                  Settings.Global.putFloat(cr, Settings.Global.ANIMATOR_DURATION_SCALE, v)
+                  Settings.Global.putFloat(cr, Settings.Global.TRANSITION_ANIMATION_SCALE, v)
+                  Settings.Global.putFloat(cr, Settings.Global.WINDOW_ANIMATION_SCALE, v)
+                  true
+              } catch (e: Throwable) { false }
+          }
+
+          class AppStat(
+              val pkg: String,
+              val label: String,
+              val icon: Drawable?,
+              val system: Boolean,
+              val fg: Long,
+              val fgs: Long,
+              val lastUsed: Long,
+              val unrestricted: Boolean,
+              val installed: Long
+          )
+
+          object Apps {
+              fun load(ctx: Context, days: Int): List<AppStat> {
+                  val pm = ctx.packageManager
+                  val power = ctx.getSystemService(PowerManager::class.java)
+                  val now = System.currentTimeMillis()
+                  val stats = if (Perms.usage(ctx)) {
+                      val usm = ctx.getSystemService(UsageStatsManager::class.java)
+                      usm?.queryAndAggregateUsageStats(now - days * 24L * 3_600_000L, now) ?: emptyMap()
+                  } else emptyMap()
+                  val out = ArrayList<AppStat>()
+                  for (app in pm.getInstalledApplications(0)) {
+                      val pkg = app.packageName
+                      if (pkg == ctx.packageName) continue
+                      val system = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                      val u = stats[pkg]
+                      val fg = u?.totalTimeInForeground ?: 0L
+                      val fgs = u?.totalTimeForegroundServiceUsed ?: 0L
+                      if (system && fg == 0L && fgs == 0L) continue
+                      val launchable = pm.getLaunchIntentForPackage(pkg) != null
+                      if (system && !launchable && fgs < 60_000L) continue
+                      val installed = try { pm.getPackageInfo(pkg, 0).firstInstallTime } catch (e: Throwable) { 0L }
+                      out.add(
+                          AppStat(
+                              pkg,
+                              try { pm.getApplicationLabel(app).toString() } catch (e: Throwable) { pkg },
+                              try { pm.getApplicationIcon(app) } catch (e: Throwable) { null },
+                              system, fg, fgs, u?.lastTimeUsed ?: 0L,
+                              power?.isIgnoringBatteryOptimizations(pkg) ?: false,
+                              installed
+                          )
+                      )
+                  }
+                  return out
+              }
+
+              fun unrestrictedCount(ctx: Context): Int {
+                  val pm = ctx.packageManager
+                  val power = ctx.getSystemService(PowerManager::class.java) ?: return 0
+                  return pm.getInstalledApplications(0).count {
+                      (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 && it.packageName != ctx.packageName &&
+                          power.isIgnoringBatteryOptimizations(it.packageName)
+                  }
+              }
+          }
+
+          /** One energy-saving check. ok = null means informational (not scored). */
+          class Check(
+              val title: String,
+              val desc: String,
+              val ok: Boolean?,
+              val state: String,
+              val actionLabel: String?,
+              val action: (() -> Unit)?
+          )
+
+          object Checks {
+              fun xiaomiBattery(ctx: Context) = ctx.openFirst(
+                  comp("com.miui.securitycenter", "com.miui.powercenter.PowerSettings"),
+                  Intent("miui.intent.action.POWER_MANAGER"),
+                  Intent(Intent.ACTION_POWER_USAGE_SUMMARY)
+              )
+
+              fun xiaomiAutostart(ctx: Context) = ctx.openFirst(
+                  comp("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
+                  Intent("miui.intent.action.OP_AUTO_START"),
+                  Intent(Settings.ACTION_APPLICATION_SETTINGS)
+              )
+
+              fun batterySaver(ctx: Context) = ctx.openFirst(
+                  Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS),
+                  Intent(Intent.ACTION_POWER_USAGE_SUMMARY)
+              )
+
+              private fun gInt(cr: ContentResolver, key: String, def: Int) =
+                  try { Settings.Global.getInt(cr, key, def) } catch (e: Throwable) { def }
+
+              private fun sInt(cr: ContentResolver, key: String, def: Int) =
+                  try { Settings.System.getInt(cr, key, def) } catch (e: Throwable) { def }
+
+              fun all(a: MainActivity, unrestricted: Int): List<Check> {
+                  val cr = a.contentResolver
+                  val pm = a.getSystemService(PowerManager::class.java)
+                  val canWrite = Perms.writeSettings(a)
+                  val list = ArrayList<Check>()
+
+                  val saver = pm?.isPowerSaveMode ?: false
+                  list += Check(
+                      "Режим энергосбережения", "Ограничивает фоновую активность, синхронизацию и визуальные эффекты.",
+                      saver, if (saver) "Включён" else "Выключен", "Открыть", { batterySaver(a) }
+                  )
+
+                  val night = (a.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+                  list += Check(
+                      "Тёмная тема", "На AMOLED-экране Xiaomi 15T тёмные пиксели почти не потребляют энергию.",
+                      night, if (night) "Включена" else "Выключена", "Открыть",
+                      { a.openFirst(Intent(Settings.ACTION_DISPLAY_SETTINGS)) }
+                  )
+
+                  val autoBright = sInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, 0) == Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC
+                  list += Check(
+                      "Автояркость", "Экран — главный потребитель энергии. Автояркость не держит его ярче, чем нужно.",
+                      autoBright, if (autoBright) "Включена" else "Выключена",
+                      if (autoBright) null else "Включить",
+                      if (autoBright) null else ({
+                          if (canWrite) {
+                              Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC)
+                              a.refresh()
+                          } else Perms.requestWrite(a)
+                      })
+                  )
+
+                  val timeout = sInt(cr, Settings.System.SCREEN_OFF_TIMEOUT, 60000)
+                  list += Check(
+                      "Тайм-аут экрана", "Чем быстрее гаснет экран, тем меньше напрасного расхода. Оптимально — 30 секунд.",
+                      timeout <= 30000, fmtDuration(timeout.toLong()).let { if (timeout < 60000) "${timeout / 1000} с" else it },
+                      if (timeout <= 30000) null else "Сделать 30 с",
+                      if (timeout <= 30000) null else ({
+                          if (canWrite) {
+                              Settings.System.putInt(cr, Settings.System.SCREEN_OFF_TIMEOUT, 30000)
+                              a.refresh()
+                          } else Perms.requestWrite(a)
+                      })
+                  )
+
+                  val sync = ContentResolver.getMasterSyncAutomatically()
+                  list += Check(
+                      "Автосинхронизация аккаунтов", "Постоянные пробуждения для синхронизации — частая причина разряда в покое. Почта и мессенджеры с push продолжат работать.",
+                      !sync, if (sync) "Включена" else "Выключена",
+                      if (sync) "Выключить" else "Включить",
+                      {
+                          ContentResolver.setMasterSyncAutomatically(!sync)
+                          a.refresh()
+                      }
+                  )
+
+                  val wifiScan = gInt(cr, "wifi_scan_always_enabled", 0) == 1
+                  val bleScan = gInt(cr, "ble_scan_always_enabled", 0) == 1
+                  list += Check(
+                      "Фоновый поиск Wi-Fi и Bluetooth", "Телефон сканирует сети даже при выключенных Wi-Fi/Bluetooth ради точности геолокации. Отключение снижает расход в покое.",
+                      !(wifiScan || bleScan),
+                      when {
+                          wifiScan && bleScan -> "Wi-Fi и BT сканируют"
+                          wifiScan -> "Wi-Fi сканирует"
+                          bleScan -> "Bluetooth сканирует"
+                          else -> "Выключен"
+                      },
+                      "Открыть",
+                      {
+                          a.openFirst(
+                              Intent("android.settings.LOCATION_SCANNING_SETTINGS"),
+                              Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+                          )
+                      }
+                  )
+
+                  val anim = Booster.animScale(a)
+                  list += Check(
+                      "Анимации интерфейса", "Ускоренные анимации (0.5x) делают систему отзывчивее и немного снижают нагрузку на GPU.",
+                      anim <= 0.5f, "${fmt1(anim)}x", if (anim <= 0.5f) null else "Ускорить",
+                      if (anim <= 0.5f) null else ({ a.speedUpAnimations() })
+                  )
+
+                  list += Check(
+                      "Приложения без ограничений батареи", "Им разрешено работать в фоне без ограничений — это главный источник разряда в режиме покоя.",
+                      unrestricted <= 3, "$unrestricted шт.", "Показать", { a.showApps(2) }
+                  )
+
+                  val loc = a.getSystemService(LocationManager::class.java)?.isLocationEnabled ?: false
+                  list += Check(
+                      "Геолокация", "Выключайте, когда не пользуетесь навигацией — приложения перестанут запрашивать GPS в фоне.",
+                      null, if (loc) "Включена" else "Выключена", "Открыть",
+                      { a.openFirst(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
+                  )
+
+                  val bt = gInt(cr, Settings.Global.BLUETOOTH_ON, 0) == 1
+                  list += Check(
+                      "Bluetooth", "Если нет подключённых часов или наушников — выключите.",
+                      null, if (bt) "Включён" else "Выключен", "Открыть",
+                      { a.openFirst(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+                  )
+
+                  val nfc = try { NfcAdapter.getDefaultAdapter(a)?.isEnabled ?: false } catch (e: Throwable) { false }
+                  list += Check(
+                      "NFC", "Расход небольшой, но если не платите телефоном — можно отключить.",
+                      null, if (nfc) "Включён" else "Выключен", "Открыть",
+                      { a.openFirst(Intent(Settings.ACTION_NFC_SETTINGS), Intent(Settings.ACTION_WIRELESS_SETTINGS)) }
+                  )
+
+                  val hz = try { a.display?.refreshRate ?: 60f } catch (e: Throwable) { 60f }
+                  list += Check(
+                      "Частота обновления экрана", "Настройки → Дисплей → Частота обновления. «Стандартная» (60 Гц) заметно экономнее, чем 120/144 Гц.",
+                      null, "Сейчас ${hz.toInt()} Гц", "Открыть",
+                      { a.openFirst(Intent(Settings.ACTION_DISPLAY_SETTINGS)) }
+                  )
+
+                  list += Check(
+                      "5G и мобильная сеть", "При слабом сигнале 5G расходует заметно больше. Выберите «Предпочтительно 4G» в настройках SIM.",
+                      null, "Рекомендация", "Открыть",
+                      {
+                          a.openFirst(
+                              Intent(Settings.ACTION_NETWORK_OPERATOR_SETTINGS),
+                              Intent(Settings.ACTION_DATA_ROAMING_SETTINGS),
+                              Intent(Settings.ACTION_WIRELESS_SETTINGS)
+                          )
+                      }
+                  )
+
+                  list += Check(
+                      "Always-On Display", "Постоянно включённый экран блокировки расходует батарею в покое. Отключите или включите режим «по касанию».",
+                      null, "Рекомендация", "Открыть",
+                      { a.openFirst(comp("com.miui.aod", "com.miui.aod.settings.AODSettingsActivity"), Intent(Settings.ACTION_DISPLAY_SETTINGS)) }
+                  )
+
+                  list += Check(
+                      "Батарея HyperOS", "Фирменные режимы Xiaomi: «Ультра экономия», оптимизация зарядки, контроль фоновой активности приложений.",
+                      null, "Xiaomi", "Открыть", { xiaomiBattery(a) }
+                  )
+
+                  list += Check(
+                      "Автозапуск приложений", "Запретите автозапуск всем приложениям, которым не нужно получать уведомления.",
+                      null, "Xiaomi", "Открыть", { xiaomiAutostart(a) }
+                  )
+                  return list
+              }
+
+              fun score(list: List<Check>): Int {
+                  val scored = list.filter { it.ok != null }
+                  if (scored.isEmpty()) return 0
+                  return scored.count { it.ok == true } * 100 / scored.size
+              }
+
+              /** Applies a power profile. Returns description of what was changed. */
+              fun applyProfile(a: MainActivity, max: Boolean): String {
+                  if (!Perms.writeSettings(a)) {
+                      Perms.requestWrite(a)
+                      return "Разрешите «Изменение системных настроек» и повторите"
+                  }
+                  val cr = a.contentResolver
+                  val done = ArrayList<String>()
+                  try {
+                      Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC)
+                      done += "автояркость"
+                  } catch (e: Throwable) { }
+                  try {
+                      Settings.System.putInt(cr, Settings.System.SCREEN_OFF_TIMEOUT, if (max) 15000 else 60000)
+                      done += if (max) "тайм-аут 15 с" else "тайм-аут 1 мин"
+                  } catch (e: Throwable) { }
+                  try {
+                      Settings.System.putInt(cr, Settings.System.HAPTIC_FEEDBACK_ENABLED, if (max) 0 else 1)
+                      done += if (max) "вибро-отклик выкл." else "вибро-отклик вкл."
+                  } catch (e: Throwable) { }
+                  try {
+                      ContentResolver.setMasterSyncAutomatically(!max)
+                      done += if (max) "синхронизация выкл." else "синхронизация вкл."
+                  } catch (e: Throwable) { }
+                  if (Perms.secure(a)) {
+                      Booster.setAnimScale(a, if (max) 0.5f else 1f)
+                      done += if (max) "анимации 0.5x" else "анимации 1x"
+                  }
+                  return "Применено: " + done.joinToString(", ")
+              }
+          }
+          VG_END_OF_FILE
+          mkdir -p app/src/main/java/com/voltguard/app
+          cat > app/src/main/java/com/voltguard/app/Ui.kt <<'VG_END_OF_FILE'
+          package com.voltguard.app
+
+          import android.content.Context
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.Executors
+
+          object C {
+              val BG = 0xFF0A0E17.toInt()
+              val NAV = 0xFF0F1420.toInt()
+              val CARD = 0xFF141A28.toInt()
+              val CARD2 = 0xFF1B2335.toInt()
+              val LINE = 0xFF263049.toInt()
+              val TEXT = 0xFFEEF2FF.toInt()
+              val SUB = 0xFF8B95AE.toInt()
+              val MINT = 0xFF2EE6A8.toInt()
+              val BLUE = 0xFF4D8DFF.toInt()
+              val VIOLET = 0xFF9B6BFF.toInt()
+              val AMBER = 0xFFFFB648.toInt()
+              val RED = 0xFFFF5A76.toInt()
+              val CYAN = 0xFF2BD4F5.toInt()
+          }
+
+          const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+          const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+          private val pool = Executors.newFixedThreadPool(3)
+          private val mainHandler = Handler(Looper.getMainLooper())
+
+          /** Run [work] on a background thread and deliver the result on the UI thread. */
+          fun <T> bg(work: () -> T, done: (T) -> Unit) {
+              pool.execute {
+                  val r = runCatching(work)
+                  mainHandler.post {
+                      r.onSuccess { done(it) }
+                      r.onFailure { it.printStackTrace() }
+                  }
+              }
+          }
+
+          fun bgRun(work: () -> Unit) {
+              pool.execute { runCatching(work) }
+          }
+
+          fun Context.dp(v: Float): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+          fun Context.dp(v: Int): Int = dp(v.toFloat())
+
+          val BOLD: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+          val BLACK: Typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+
+          fun Context.text(
+              s: CharSequence,
+              sp: Float = 14f,
+              color: Int = C.TEXT,
+              bold: Boolean = false
+          ): TextView = TextView(this).apply {
+              text = s
+              textSize = sp
+              setTextColor(color)
+              if (bold) typeface = BOLD
+              setLineSpacing(0f, 1.12f)
+          }
+
+          fun Context.vbox(): LinearLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+          fun Context.hbox(): LinearLayout = LinearLayout(this).apply {
+              orientation = LinearLayout.HORIZONTAL
+              gravity = Gravity.CENTER_VERTICAL
+          }
+
+          fun Context.rounded(color: Int, radiusDp: Float = 20f, stroke: Int = 0): GradientDrawable =
+              GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = dp(radiusDp).toFloat()
+                  if (stroke != 0) setStroke(dp(1), stroke)
+              }
+
+          fun Context.gradient(c1: Int, c2: Int, radiusDp: Float = 20f): GradientDrawable =
+              GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c1, c2)).apply {
+                  cornerRadius = dp(radiusDp).toFloat()
+              }
+
+          fun Context.card(color: Int = C.CARD): LinearLayout = vbox().apply {
+              background = rounded(color, 22f)
+              setPadding(dp(16), dp(16), dp(16), dp(16))
+          }
+
+          /** Adds [v] to this LinearLayout with sizes in px (MATCH/WRAP allowed) and margins in dp. */
+          fun <V : View> LinearLayout.add(
+              v: V,
+              w: Int = MATCH,
+              h: Int = WRAP,
+              weight: Float = 0f,
+              top: Int = 0,
+              bottom: Int = 0,
+              start: Int = 0,
+              end: Int = 0
+          ): V {
+              val lp = LinearLayout.LayoutParams(w, h, weight)
+              val c = context
+              lp.setMargins(c.dp(start), c.dp(top), c.dp(end), c.dp(bottom))
+              addView(v, lp)
+              return v
+          }
+
+          fun Context.pill(label: String, color: Int = C.MINT, filled: Boolean = true, onClick: () -> Unit): TextView =
+              text(label, 14f, if (filled) 0xFF06121A.toInt() else color, true).apply {
+                  gravity = Gravity.CENTER
+                  setPadding(dp(16), dp(11), dp(16), dp(11))
+                  background = if (filled) rounded(color, 14f) else rounded(0x00000000, 14f, color)
+                  isClickable = true
+                  isFocusable = true
+                  setOnClickListener { onClick() }
+              }
+
+          fun Context.chip(label: String, active: Boolean, onClick: () -> Unit): TextView =
+              text(label, 13f, if (active) 0xFF06121A.toInt() else C.SUB, true).apply {
+                  gravity = Gravity.CENTER
+                  setPadding(dp(14), dp(8), dp(14), dp(8))
+                  background = if (active) rounded(C.MINT, 12f) else rounded(C.CARD2, 12f)
+                  setOnClickListener { onClick() }
+              }
+
+          fun Context.sectionTitle(s: String): TextView = text(s, 18f, C.TEXT, true).apply {
+              setPadding(dp(4), dp(18), 0, dp(8))
+          }
+
+          /** A small tile: label on top, big value under it. Returns the tile and the value TextView. */
+          fun Context.statTile(label: String, value: String, accent: Int = C.TEXT): Pair<LinearLayout, TextView> {
+              val box = vbox().apply {
+                  background = rounded(C.CARD2, 16f)
+                  setPadding(dp(12), dp(10), dp(12), dp(12))
+              }
+              box.add(text(label, 12f, C.SUB))
+              val v = box.add(text(value, 18f, accent, true), top = 2)
+              return box to v
+          }
+
+          /** Grid of tiles, [cols] per row. */
+          fun Context.grid(tiles: List<View>, cols: Int = 2): LinearLayout {
+              val out = vbox()
+              tiles.chunked(cols).forEachIndexed { idx, row ->
+                  val r = hbox()
+                  row.forEachIndexed { i, t ->
+                      r.add(t, 0, WRAP, 1f, start = if (i == 0) 0 else 5, end = if (i == row.size - 1) 0 else 5)
+                  }
+                  for (k in row.size until cols) r.add(View(this), 0, 1, 1f, start = 5)
+                  out.add(r, top = if (idx == 0) 0 else 10)
+              }
+              return out
+          }
+
+          fun Context.toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+          fun fmtBytes(b: Long): String {
+              val v = b.toDouble()
+              return when {
+                  b < 1024 -> "$b Б"
+                  v < 1024.0 * 1024 -> String.format(Locale.US, "%.0f КБ", v / 1024)
+                  v < 1024.0 * 1024 * 1024 -> String.format(Locale.US, "%.1f МБ", v / 1024 / 1024)
+                  else -> String.format(Locale.US, "%.2f ГБ", v / 1024 / 1024 / 1024)
+              }
+          }
+
+          fun fmtDuration(ms: Long): String {
+              if (ms <= 0) return "0 мин"
+              val totalMin = ms / 60000
+              val d = totalMin / (60 * 24)
+              val h = (totalMin / 60) % 24
+              val m = totalMin % 60
+              return when {
+                  d > 0 -> "$d д $h ч"
+                  h > 0 -> "$h ч $m мин"
+                  else -> "$m мин"
+              }
+          }
+
+          fun fmtHours(h: Float): String = fmtDuration((h * 3_600_000).toLong())
+
+          fun fmt1(v: Float): String = String.format(Locale.US, "%.1f", v)
+          fun fmt2(v: Float): String = String.format(Locale.US, "%.2f", v)
+
+          fun fmtTime(t: Long, pattern: String = "HH:mm"): String =
+              SimpleDateFormat(pattern, Locale.getDefault()).format(Date(t))
+          VG_END_OF_FILE
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_fg.xml <<'VG_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FF4D8DFF"
+                  android:strokeWidth="3"
+                  android:pathData="M54,26 C69.5,26 82,38.5 82,54 C82,69.5 69.5,82 54,82 C38.5,82 26,69.5 26,54 C26,38.5 38.5,26 54,26 Z" />
+              <path
+                  android:fillColor="#FF2EE6A8"
+                  android:pathData="M58,32 L40,57 L52,57 L48,76 L68,49 L56,49 Z" />
+          </vector>
+          VG_END_OF_FILE
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'VG_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
+          VG_END_OF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'VG_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="bg">#FF0A0E17</color>
+              <color name="ic_bg">#FF0F1A2E</color>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:colorBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+                  <item name="android:colorAccent">#FF2EE6A8</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+          </resources>
+          VG_END_OF_FILE
+          cat > build.gradle.kts <<'VG_END_OF_FILE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          VG_END_OF_FILE
+          cat > gradle.properties <<'VG_END_OF_FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          VG_END_OF_FILE
+          cat > settings.gradle.kts <<'VG_END_OF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VoltGuard"
+          include(":app")
+          VG_END_OF_FILE
+          find . -type f
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare APK
+        run: cp proj/app/build/outputs/apk/debug/app-debug.apk VoltGuard.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoltGuard-apk
+          path: VoltGuard.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: VoltGuard build ${{ github.run_number }}
+          files: VoltGuard.apk
